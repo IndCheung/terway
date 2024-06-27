@@ -9,15 +9,12 @@ import (
 // backoff keys
 const (
 	DefaultKey            = ""
-	ENICreate             = "eni_create"
 	ENIOps                = "eni_ops"
 	ENIRelease            = "eni_release"
-	ENIIPOps              = "eni_ip_ops"
 	WaitENIStatus         = "wait_eni_status"
 	WaitPodENIStatus      = "wait_podeni_status"
 	MetaAssignPrivateIP   = "meta_assign_private_ip"
 	MetaUnAssignPrivateIP = "meta_unassign_private_ip"
-	WaitStsTokenReady     = "wait_sts_token_ready"
 )
 
 var backoffMap = map[string]wait.Backoff{
@@ -26,12 +23,6 @@ var backoffMap = map[string]wait.Backoff{
 		Factor:   1.5,
 		Jitter:   0.3,
 		Steps:    6,
-	},
-	ENICreate: {
-		Duration: time.Second * 10,
-		Factor:   2,
-		Jitter:   0.3,
-		Steps:    2,
 	},
 	ENIOps: {
 		Duration: time.Second * 5,
@@ -44,12 +35,6 @@ var backoffMap = map[string]wait.Backoff{
 		Factor:   2,
 		Jitter:   0.5,
 		Steps:    8,
-	},
-	ENIIPOps: {
-		Duration: time.Second * 5,
-		Factor:   1,
-		Jitter:   1.3,
-		Steps:    6,
 	},
 	WaitENIStatus: {
 		Duration: time.Second * 5,
@@ -74,12 +59,6 @@ var backoffMap = map[string]wait.Backoff{
 		Factor:   1,
 		Jitter:   0.2,
 		Steps:    10,
-	},
-	WaitStsTokenReady: {
-		Duration: time.Second,
-		Factor:   1,
-		Jitter:   0.2,
-		Steps:    60,
 	},
 }
 

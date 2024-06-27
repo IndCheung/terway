@@ -14,45 +14,27 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//go:generate mockery --name Interface --tags default_build
-
 package register
 
 import (
-	aliyunClient "github.com/AliyunContainerService/terway/pkg/aliyun/client"
-	"github.com/AliyunContainerService/terway/pkg/vswitch"
-	"github.com/AliyunContainerService/terway/types/controlplane"
+	"github.com/AliyunContainerService/terway/pkg/aliyun/client"
+	"github.com/AliyunContainerService/terway/pkg/controller/vswitch"
 
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 )
 
 // Interface aliyun client for terway-controlplane
 type Interface interface {
-	aliyunClient.VPC
-	aliyunClient.ECS
+	client.VSwitch
+	client.ENI
 }
 
-type ControllerCtx struct {
-	Config       *controlplane.Config
-	VSwitchPool  *vswitch.SwitchPool
-	AliyunClient Interface
-}
-
-type Creator func(mgr manager.Manager, ctrlCtx *ControllerCtx) error
+type Creator func(mgr manager.Manager, aliyunClient Interface, swPool *vswitch.SwitchPool) error
 
 // Controllers collect for all controller
-var Controllers = map[string]struct {
-	Creator Creator
-	Enable  bool
-}{}
+var Controllers = map[string]Creator{}
 
-// Add add controller by name
-func Add(name string, creator Creator, enable bool) {
-	Controllers[name] = struct {
-		Creator Creator
-		Enable  bool
-	}{
-		Creator: creator,
-		Enable:  enable,
-	}
+// Add add controller buy name
+func Add(name string, creator Creator) {
+	Controllers[name] = creator
 }

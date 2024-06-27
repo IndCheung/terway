@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"os"
 
 	terwayIP "github.com/AliyunContainerService/terway/pkg/ip"
 	terwaySysctl "github.com/AliyunContainerService/terway/pkg/sysctl"
@@ -70,6 +69,40 @@ func DelLinkByName(ifName string) error {
 		}
 	}
 	return LinkDel(contLink)
+}
+
+// EnsureAddrWithPrefix take the ipNet set and ensure only one IP for each family is present on link
+// it will remove other unmatched IPs
+func EnsureAddrWithPrefix(link netlink.Link, ipNetSet *terwayTypes.IPNetSet, prefixRoute bool) (bool, error) {
+	var changed bool
+
+	if ipNetSet.IPv4 != nil {
+		newAddr := &netlink.Addr{IPNet: ipNetSet.IPv4}
+		if !prefixRoute {
+			newAddr.Flags = unix.IFA_F_NOPREFIXROUTE
+		}
+		c, err := EnsureAddr(link, newAddr)
+		if err != nil {
+			return c, err
+		}
+		if c {
+			changed = true
+		}
+	}
+	if ipNetSet.IPv6 != nil {
+		newAddr := &netlink.Addr{IPNet: ipNetSet.IPv6}
+		if !prefixRoute {
+			newAddr.Flags = unix.IFA_F_NOPREFIXROUTE
+		}
+		c, err := EnsureAddr(link, newAddr)
+		if err != nil {
+			return c, err
+		}
+		if c {
+			changed = true
+		}
+	}
+	return changed, nil
 }
 
 // EnsureAddr ensure only one IP for each family is present on link
@@ -282,7 +315,7 @@ func GetHostIP(ipv4, ipv6 bool) (*terwayTypes.IPNetSet, error) {
 			return nil, err
 		}
 		if terwayIP.IPv6(v4) {
-			return nil, fmt.Errorf("error get node ipv4 address.This may due to 1. no ipv4 address 2. no ipv4 default route")
+			return nil, fmt.Errorf("error get node ipv4 address.This may dure to 1. no ipv4 address 2. no ipv4 default route")
 		}
 		nodeIPv4 = &net.IPNet{
 			IP:   v4,
@@ -296,7 +329,7 @@ func GetHostIP(ipv4, ipv6 bool) (*terwayTypes.IPNetSet, error) {
 			return nil, err
 		}
 		if !terwayIP.IPv6(v6) {
-			return nil, fmt.Errorf("error get node ipv6 address.This may due to 1. no ipv6 address 2. no ipv6 default route")
+			return nil, fmt.Errorf("error get node ipv6 address.This may dure to 1. no ipv6 address 2. no ipv6 default route")
 		}
 		nodeIPv6 = &net.IPNet{
 			IP:   v6,
@@ -355,9 +388,7 @@ func EnsureNetConfSet(ipv4, ipv6 bool) error {
 			for _, cfg := range ipv4NetConfig {
 				innerErr := terwaySysctl.EnsureConf(fmt.Sprintf(cfg[0], link.Attrs().Name), cfg[1])
 				if innerErr != nil {
-					if !os.IsNotExist(innerErr) {
-						err = fmt.Errorf("%v, %w", err, innerErr)
-					}
+					err = fmt.Errorf("%v, %w", err, innerErr)
 				}
 			}
 		}
@@ -365,9 +396,7 @@ func EnsureNetConfSet(ipv4, ipv6 bool) error {
 			for _, cfg := range ipv6NetConfig {
 				innerErr := terwaySysctl.EnsureConf(fmt.Sprintf(cfg[0], link.Attrs().Name), cfg[1])
 				if innerErr != nil {
-					if !os.IsNotExist(innerErr) {
-						err = fmt.Errorf("%v, %w", err, innerErr)
-					}
+					err = fmt.Errorf("%v, %w", err, innerErr)
 				}
 			}
 		}
@@ -397,7 +426,6 @@ func EnsureVlanUntagger(link netlink.Link) error {
 			}
 		}
 	}
-
 	vlanAct := netlink.NewVlanKeyAction()
 	vlanAct.Action = netlink.TCA_VLAN_KEY_POP
 	u32 := &netlink.U32{
@@ -427,77 +455,6 @@ func EnsureVlanUntagger(link netlink.Link) error {
 	return nil
 }
 
-// EnsureVlanTag use tc-vlan set vlan tag
-func EnsureVlanTag(link netlink.Link, ipNetSet *terwayTypes.IPNetSet, vid uint16) error {
-	err := EnsureClsActQdsic(link)
-	if err != nil {
-		return fmt.Errorf("error ensure cls act qdisc for %s vlan tag, %w", link.Attrs().Name, err)
-	}
-
-	filters, err := netlink.FilterList(link, netlink.HANDLE_MIN_EGRESS)
-	if err != nil {
-		return fmt.Errorf("list ingress filter for %s error, %w", link.Attrs().Name, err)
-	}
-
-	exec := func(ipNet *net.IPNet) error {
-		vlanAct := netlink.NewVlanKeyAction()
-		vlanAct.Attrs().Action = netlink.TC_ACT_PIPE
-		vlanAct.Action = netlink.TCA_VLAN_KEY_PUSH
-		vlanAct.Vid = vid
-		expect := &netlink.U32{
-			FilterAttrs: netlink.FilterAttrs{
-				LinkIndex: link.Attrs().Index,
-				Parent:    netlink.HANDLE_MIN_EGRESS,
-				Priority:  50001,
-				Protocol:  uint16(unix.ETH_P_IP),
-			},
-			Actions: []netlink.Action{vlanAct},
-		}
-		tc.MatchSrc(expect, ipNet)
-
-		for _, filter := range filters {
-			u32, ok := filter.(*netlink.U32)
-			if !ok {
-				continue
-			}
-			if u32.Attrs().LinkIndex != link.Attrs().Index || u32.Attrs().Protocol != unix.ETH_P_IP || len(u32.Actions) == 0 || u32.Sel == nil {
-				continue
-			}
-			act, ok := u32.Actions[0].(*netlink.VlanAction)
-			if !ok {
-				continue
-			}
-			if act.Action != netlink.TCA_VLAN_KEY_PUSH || act.Attrs().Action != netlink.TC_ACT_PIPE {
-				continue
-			}
-			if !tc.Contain(u32.Sel.Keys, expect.Sel.Keys) {
-				continue
-			}
-			if act.Vid != vid {
-				err = FilterDel(u32)
-				if err != nil {
-					return err
-				}
-				continue
-			}
-			return nil
-		}
-
-		return FilterAdd(expect)
-	}
-
-	if ipNetSet.IPv4 != nil {
-		err = exec(NewIPNetWithMaxMask(ipNetSet.IPv4))
-		if err != nil {
-			return err
-		}
-	}
-	if ipNetSet.IPv6 != nil {
-		err = exec(NewIPNetWithMaxMask(ipNetSet.IPv6))
-	}
-	return err
-}
-
 func EnsureClsActQdsic(link netlink.Link) error {
 	qds, err := netlink.QdiscList(link)
 	if err != nil {
@@ -519,203 +476,6 @@ func EnsureClsActQdsic(link netlink.Link) error {
 	}
 	if err := QdiscReplace(qdisc); err != nil {
 		return fmt.Errorf("replace clsact qdisc for dev %s error, %w", link.Attrs().Name, err)
-	}
-	return nil
-}
-
-// EnsurePrioQdiscAt10 write qdisc  attach under mq
-func EnsurePrioQdiscAt10(link netlink.Link) error {
-	qds, err := netlink.QdiscList(link)
-	if err != nil {
-		return fmt.Errorf("list qdisc for dev %s error, %w", link.Attrs().Name, err)
-	}
-	for _, q := range qds {
-		// only handle qd under mq at 1:
-		major, minor := netlink.MajorMinor(q.Attrs().Parent)
-		if major != 1 || minor == 0 {
-			continue
-		}
-
-		_, ok := q.(*netlink.Prio)
-		if !ok {
-			err = QdiscReplace(netlink.NewPrio(netlink.QdiscAttrs{
-				LinkIndex: link.Attrs().Index,
-				Parent:    q.Attrs().Parent,
-			}))
-			if err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-// EnsureMQQdisc write qdisc
-func EnsureMQQdisc(link netlink.Link) error {
-	qds, err := netlink.QdiscList(link)
-	if err != nil {
-		return fmt.Errorf("list qdisc for dev %s error, %w", link.Attrs().Name, err)
-	}
-	var prev netlink.Qdisc
-	for _, q := range qds {
-		_, minor := netlink.MajorMinor(q.Attrs().Handle)
-		if q.Attrs().Parent == netlink.HANDLE_ROOT && minor == 0 {
-			prev = q
-		}
-
-		if q.Type() == "mq" && q.Attrs().Parent == netlink.HANDLE_ROOT && q.Attrs().Handle == netlink.MakeHandle(1, 0) {
-			return nil
-		}
-	}
-	if prev != nil {
-		_ = QdiscDel(prev)
-	}
-
-	return QdiscReplace(&netlink.GenericQdisc{
-		QdiscAttrs: netlink.QdiscAttrs{
-			LinkIndex: link.Attrs().Index,
-			Parent:    netlink.HANDLE_ROOT,
-			Handle:    netlink.MakeHandle(1, 0),
-		},
-		QdiscType: "mq",
-	})
-}
-
-func FilterAdd(filter *netlink.U32) error {
-	cmd := fmt.Sprintf("tc filter add %s", filter.String())
-	Log.Info(cmd)
-	err := netlink.FilterAdd(filter)
-	if err != nil {
-		return fmt.Errorf("error %s, %w", cmd, err)
-	}
-	return nil
-}
-
-func FilterDel(filter netlink.Filter) error {
-	cmd := fmt.Sprintf("tc filter del %s", filter.Attrs().String())
-	Log.Info(cmd)
-	err := netlink.FilterDel(filter)
-	if err != nil {
-		return fmt.Errorf("error %s, %w", cmd, err)
-	}
-	return nil
-}
-
-// SetFilter write u32 filter
-func SetFilter(link netlink.Link, parentID, classID uint32, ipNetSet *terwayTypes.IPNetSet) error {
-	exec := func(ipNet *net.IPNet) error {
-		found, err := tc.FilterBySrcIP(link, parentID, ipNet)
-		if err != nil {
-			return err
-		}
-		if found != nil && found.ClassId == classID {
-			return nil
-		}
-
-		u32 := &netlink.U32{
-			FilterAttrs: netlink.FilterAttrs{
-				LinkIndex: link.Attrs().Index,
-				Parent:    parentID,
-				Priority:  1,
-				Protocol:  unix.ETH_P_IP,
-			},
-			ClassId: classID,
-		}
-		tc.MatchSrc(u32, ipNet)
-
-		return FilterAdd(u32)
-	}
-
-	if ipNetSet.IPv4 != nil {
-		err := exec(NewIPNetWithMaxMask(ipNetSet.IPv4))
-		if err != nil {
-			return err
-		}
-	}
-	if ipNetSet.IPv6 != nil {
-		err := exec(NewIPNetWithMaxMask(ipNetSet.IPv6))
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// DelFilter del u32 filter by pod ip
-func DelFilter(link netlink.Link, parentID uint32, ipNetSet *terwayTypes.IPNetSet) error {
-	exec := func(ipNet *net.IPNet) error {
-		found, err := tc.FilterBySrcIP(link, parentID, ipNet)
-		if err != nil {
-			return err
-		}
-		if found == nil {
-			return nil
-		}
-		err = FilterDel(found)
-		if err != nil {
-			return err
-		}
-		return nil
-	}
-
-	if ipNetSet.IPv4 != nil {
-		err := exec(NewIPNetWithMaxMask(ipNetSet.IPv4))
-		if err != nil {
-			return err
-		}
-	}
-	if ipNetSet.IPv6 != nil {
-		err := exec(NewIPNetWithMaxMask(ipNetSet.IPv6))
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-// SetEgressPriority write egress priority rule for pod
-func SetEgressPriority(link netlink.Link, classID uint32, ipNetSet *terwayTypes.IPNetSet) error {
-	err := EnsureMQQdisc(link)
-	if err != nil {
-		return err
-	}
-	err = EnsurePrioQdiscAt10(link)
-	if err != nil {
-		return err
-	}
-	qds, err := netlink.QdiscList(link)
-	if err != nil {
-		return fmt.Errorf("list qdisc for dev %s error, %w", link.Attrs().Name, err)
-	}
-	for _, q := range qds {
-		_, ok := q.(*netlink.Prio)
-		if !ok {
-			continue
-		}
-
-		err = SetFilter(link, q.Attrs().Handle, classID, ipNetSet)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func DelEgressPriority(link netlink.Link, ipNetSet *terwayTypes.IPNetSet) error {
-	qds, err := netlink.QdiscList(link)
-	if err != nil {
-		return err
-	}
-	for _, q := range qds {
-		_, ok := q.(*netlink.Prio)
-		if !ok {
-			continue
-		}
-		err = DelFilter(link, q.Attrs().Handle, ipNetSet)
-		if err != nil {
-			return err
-		}
 	}
 	return nil
 }

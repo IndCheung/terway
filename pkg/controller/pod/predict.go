@@ -19,21 +19,18 @@ package pod
 import (
 	"reflect"
 
+	"github.com/AliyunContainerService/terway/types"
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
-
-	"github.com/AliyunContainerService/terway/types"
 )
 
 type predicateForPodEvent struct {
 	predicate.Funcs
-
-	crdMode bool
 }
 
 func (p *predicateForPodEvent) Create(e event.CreateEvent) bool {
-	return OKToProcess(e.Object, p.crdMode)
+	return OKToProcess(e.Object)
 }
 
 func (p *predicateForPodEvent) Update(e event.UpdateEvent) bool {
@@ -46,24 +43,14 @@ func (p *predicateForPodEvent) Update(e event.UpdateEvent) bool {
 		return false
 	}
 
-	if newPod.Spec.HostNetwork {
+	if !types.PodUseENI(oldPod) {
+		return false
+	}
+	if !types.PodUseENI(newPod) {
 		return false
 	}
 	if newPod.Spec.NodeName == "" {
 		return false
-	}
-
-	if types.IgnoredByTerway(newPod.Labels) {
-		return false
-	}
-
-	if !p.crdMode {
-		if !types.PodUseENI(oldPod) {
-			return false
-		}
-		if !types.PodUseENI(newPod) {
-			return false
-		}
 	}
 
 	oldPodCopy := oldPod.DeepCopy()
@@ -79,15 +66,15 @@ func (p *predicateForPodEvent) Update(e event.UpdateEvent) bool {
 }
 
 func (p *predicateForPodEvent) Delete(e event.DeleteEvent) bool {
-	return OKToProcess(e.Object, p.crdMode)
+	return OKToProcess(e.Object)
 }
 
 func (p *predicateForPodEvent) Generic(e event.GenericEvent) bool {
-	return OKToProcess(e.Object, p.crdMode)
+	return OKToProcess(e.Object)
 }
 
 // OKToProcess filter pod which is ready to process
-func OKToProcess(obj interface{}, crdMode bool) bool {
+func OKToProcess(obj interface{}) bool {
 	pod, ok := obj.(*corev1.Pod)
 	if !ok {
 		return false
@@ -95,19 +82,6 @@ func OKToProcess(obj interface{}, crdMode bool) bool {
 	if pod.Spec.NodeName == "" {
 		return false
 	}
-
-	if pod.Spec.HostNetwork {
-		return false
-	}
-
-	if types.IgnoredByTerway(pod.Labels) {
-		return false
-	}
-
-	if crdMode {
-		return true
-	}
-
 	// 1. process pods only enable trunk
 	// 2. if pod turn from trunk to normal pod, assume delete is called
 	// 3. podENI will do remain GC if resource is leaked

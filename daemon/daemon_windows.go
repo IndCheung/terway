@@ -7,14 +7,12 @@ import (
 	"github.com/pkg/errors"
 
 	"github.com/AliyunContainerService/terway/pkg/aliyun/metadata"
-	"github.com/AliyunContainerService/terway/pkg/k8s"
 	"github.com/AliyunContainerService/terway/pkg/windows/apis"
 	"github.com/AliyunContainerService/terway/pkg/windows/iface"
 	"github.com/AliyunContainerService/terway/pkg/windows/ip"
-	"github.com/AliyunContainerService/terway/types/daemon"
 )
 
-func preStartResourceManager(daemonMode string, k8s k8s.Kubernetes) error {
+func preStartResourceManager(daemonMode string, k8s Kubernetes) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -24,7 +22,7 @@ func preStartResourceManager(daemonMode string, k8s k8s.Kubernetes) error {
 	}
 
 	switch daemonMode {
-	case daemon.ModeVPC:
+	case daemonModeVPC:
 		var nwIface, err = iface.GetInterfaceByMAC(primaryMac, true)
 		if err != nil {
 			return errors.Wrap(err, "error getting interface")
@@ -41,7 +39,7 @@ func preStartResourceManager(daemonMode string, k8s k8s.Kubernetes) error {
 		if err != nil {
 			return errors.Wrapf(err, "error adding network: %s", nw.Format(apis.HNS))
 		}
-	case daemon.ModeENIOnly, daemon.ModeENIMultiIP:
+	case daemonModeENIOnly, daemonModeENIMultiIP:
 		// NB(thxCode): create a fake network to allow service connection
 		var assistantIface, err = iface.GetInterfaceByMAC(primaryMac, true)
 		if err != nil {

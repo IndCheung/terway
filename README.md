@@ -246,8 +246,8 @@ kind: Pod
 metadata:
   name: nginx
   annotations:
-    kubernetes.io/ingress-bandwidth: 10M
-    kubernetes.io/egress-bandwidth: 10M
+    k8s.aliyun.com/ingress-bandwidth: 1m
+    k8s.aliyun.com/egress-bandwidth: 1m
 spec:
   nodeSelector:
     kubernetes.io/hostname: cn-shanghai.i-uf63p6s96kf4jfh8wpwn
@@ -316,7 +316,3 @@ slave device.
 ### DingTalk
 
 Join `DingTalk` group by `DingTalkGroup` id "35924643".
-
-## Security
-
-Please report vulnerabilities by email to [kubernetes-security@service.aliyun.com](mailto:kubernetes-security@service.aliyun.com). Also see our [SECURITY.md](SECURITY.md) file for details.

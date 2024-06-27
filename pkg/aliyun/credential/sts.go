@@ -7,18 +7,15 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"os"
 	"time"
 
 	"github.com/aliyun/alibaba-cloud-sdk-go/sdk/auth/credentials"
-	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	"github.com/sirupsen/logrus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/util/retry"
 
-	"github.com/AliyunContainerService/terway/pkg/backoff"
 	"github.com/AliyunContainerService/terway/pkg/utils"
-	"github.com/AliyunContainerService/terway/pkg/utils/k8sclient"
 )
 
 type EncryptedCredentialInfo struct {
@@ -61,26 +58,14 @@ func (e *EncryptedCredentialProvider) Resolve() (*Credential, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to read config %s, err: %w", e.credentialPath, err)
 		}
-		encodeTokenCfg, err = os.ReadFile(e.credentialPath)
+		encodeTokenCfg, err = ioutil.ReadFile(e.credentialPath)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read token config, err: %w", err)
 		}
 	} else {
 		log.Infof("resolve secret %s/%s", e.secretNamespace, e.secretName)
 
-		var secret *corev1.Secret
-		err = retry.OnError(backoff.Backoff(backoff.WaitStsTokenReady), func(err error) bool {
-			if errors.IsNotFound(err) || errors.IsTooManyRequests(err) {
-				return true
-			}
-			return false
-		}, func() error {
-			secret, err = k8sclient.K8sClient.CoreV1().Secrets(e.secretNamespace).Get(context.Background(), e.secretName, metav1.GetOptions{})
-			if err != nil {
-				return err
-			}
-			return nil
-		})
+		secret, err := utils.K8sClient.CoreV1().Secrets(e.secretNamespace).Get(context.Background(), e.secretName, metav1.GetOptions{})
 		if err != nil {
 			return nil, err
 		}
@@ -132,11 +117,13 @@ func pks5UnPadding(origData []byte) []byte {
 func decrypt(s string, keyring []byte) ([]byte, error) {
 	cdata, err := base64.StdEncoding.DecodeString(s)
 	if err != nil {
-		return nil, fmt.Errorf("failed to decode base64 string, err: %w", err)
+		logrus.Errorf("failed to decode base64 string, err: %v", err)
+		return nil, err
 	}
 	block, err := aes.NewCipher(keyring)
 	if err != nil {
-		return nil, fmt.Errorf("failed to new cipher, err:%w", err)
+		logrus.Errorf("failed to new cipher, err: %v", err)
+		return nil, err
 	}
 	blockSize := block.BlockSize()
 
@@ -148,25 +135,4 @@ func decrypt(s string, keyring []byte) ([]byte, error) {
 
 	origData = pks5UnPadding(origData)
 	return origData, nil
-}
-
-type StsTokenCredentialProvider struct {
-	StsTokenCredential *credentials.StsTokenCredential
-}
-
-func NewStsTokenCredentialProvider(ak, sk, token string) *StsTokenCredentialProvider {
-	return &StsTokenCredentialProvider{
-		StsTokenCredential: credentials.NewStsTokenCredential(ak, sk, token),
-	}
-}
-
-func (e *StsTokenCredentialProvider) Resolve() (*Credential, error) {
-	return &Credential{
-		Credential: e.StsTokenCredential,
-		Expiration: time.Now().AddDate(100, 0, 0),
-	}, nil
-}
-
-func (e *StsTokenCredentialProvider) Name() string {
-	return "StsTokenCredentialProvider"
 }

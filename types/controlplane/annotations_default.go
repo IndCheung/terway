@@ -1,4 +1,5 @@
 //go:build default_build
+// +build default_build
 
 /*
 Copyright 2021 Terway Authors.

@@ -239,13 +239,13 @@ function Wait-Ready
 
 # transfer artifacts to host
 Log-Debug "Transferring policy artifacts"
-Transfer-File -Src "c:\opt\bin\calico-felix.exe" -Dst "c:\host\opt\bin\calico-felix.exe"
-Transfer-File -Src "c:\etc\rules\static-rules.json" -Dst "c:\host\opt\bin\static-rules.json"
+Transfer-File -Src "$env:CONTAINER_SANDBOX_MOUNT_POINT\opt\bin\calico-felix.exe" -Dst "c:\opt\bin\calico-felix.exe"
+Transfer-File -Src "$env:CONTAINER_SANDBOX_MOUNT_POINT\etc\rules\static-rules.json" -Dst "c:\opt\bin\static-rules.json"
 Log-Info "Transferred policy artifacts"
 
 # condition
 Log-Debug "Waiting for kubernetes configuration"
-Wait-Ready -Path "c:\host\opt\bin\eni\kubeconfig.conf" -Timeout 120 -Throw
+Wait-Ready -Path "c:\opt\bin\eni\kubeconfig.conf" -Timeout 120 -Throw
 Log-Info "Waited kubernetes configuration"
 
 # run
@@ -291,7 +291,17 @@ $prc_envs | ForEach-Object {
   Log-Info "Environment ${prc_env}"
 }
 try {
-  wins cli prc run --path="$prc_path" --args="$($prc_args -join ' ')" --envs="$($prc_envs -join ' ')"
+  $Env:USE_POD_CIDR="true"
+  $Env:KUBE_NETWORK=${env_network_name_regex}
+  $Env:FELIX_METADATAADDR="none"
+  $Env:FELIX_FELIXHOSTNAME=${env_node_name}
+  $Env:FELIX_LOGSEVERITYFILE="ERROR"
+  $Env:FELIX_LOGSEVERITYSYS="ERROR"
+  $Env:FELIX_LOGSEVERITYSCREEN=${env_log_level}
+  $Env:FELIX_PROMETHEUSMETRICSENABLED=${env_enable_metrics}
+  $Env:FELIX_DATASTORETYPE="kubernetes"
+  $Env:KUBECONFIG="c:\opt\bin\eni\kubeconfig.conf"
+  & $prc_path @prc_args
 } catch {
   Log-Fatal "Failed to execute calico-felix: $($_.Exception.Message)"
 } finally {

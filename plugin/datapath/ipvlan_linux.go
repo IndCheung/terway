@@ -28,8 +28,6 @@ const (
 
 var (
 	regexKernelVersion = regexp.MustCompile(`^(\d+)\.(\d+)`)
-
-	defaultMAC, _ = net.ParseMAC("ee:ff:ff:ff:ff:ff")
 )
 
 type IPvlanDriver struct{}
@@ -58,11 +56,7 @@ func generateContCfgForIPVlan(cfg *types.SetupConfig, link netlink.Link) *nic.Co
 	}
 
 	if cfg.ContainerIPNet.IPv4 != nil {
-		if cfg.StripVlan {
-			addrs = append(addrs, &netlink.Addr{IPNet: utils.NewIPNetWithMaxMask(cfg.ContainerIPNet.IPv4)})
-		} else {
-			addrs = append(addrs, &netlink.Addr{IPNet: cfg.ContainerIPNet.IPv4})
-		}
+		addrs = append(addrs, &netlink.Addr{IPNet: cfg.ContainerIPNet.IPv4})
 
 		// add default route
 		if cfg.DefaultRoute {
@@ -87,15 +81,6 @@ func generateContCfgForIPVlan(cfg *types.SetupConfig, link netlink.Link) *nic.Co
 			State:        netlink.NUD_PERMANENT,
 		})
 
-		if cfg.StripVlan {
-			neighs = append(neighs, &netlink.Neigh{
-				LinkIndex:    link.Attrs().Index,
-				IP:           cfg.GatewayIP.IPv4,
-				HardwareAddr: defaultMAC,
-				State:        netlink.NUD_PERMANENT,
-			})
-		}
-
 		if cfg.MultiNetwork {
 			table := utils.GetRouteTableID(link.Attrs().Index)
 
@@ -119,11 +104,7 @@ func generateContCfgForIPVlan(cfg *types.SetupConfig, link netlink.Link) *nic.Co
 		}
 	}
 	if cfg.ContainerIPNet.IPv6 != nil {
-		if cfg.StripVlan {
-			addrs = append(addrs, &netlink.Addr{IPNet: utils.NewIPNetWithMaxMask(cfg.ContainerIPNet.IPv6)})
-		} else {
-			addrs = append(addrs, &netlink.Addr{IPNet: cfg.ContainerIPNet.IPv6})
-		}
+		addrs = append(addrs, &netlink.Addr{IPNet: cfg.ContainerIPNet.IPv6})
 
 		// add default route
 		if cfg.DefaultRoute {
@@ -147,14 +128,6 @@ func generateContCfgForIPVlan(cfg *types.SetupConfig, link netlink.Link) *nic.Co
 			HardwareAddr: link.Attrs().HardwareAddr,
 			State:        netlink.NUD_PERMANENT,
 		})
-		if cfg.StripVlan {
-			neighs = append(neighs, &netlink.Neigh{
-				LinkIndex:    link.Attrs().Index,
-				IP:           cfg.GatewayIP.IPv6,
-				HardwareAddr: defaultMAC,
-				State:        netlink.NUD_PERMANENT,
-			})
-		}
 
 		if cfg.MultiNetwork {
 			table := utils.GetRouteTableID(link.Attrs().Index)
@@ -262,20 +235,6 @@ func (d *IPvlanDriver) Setup(cfg *types.SetupConfig, netNS ns.NetNS) error {
 		return err
 	}
 
-	if cfg.EnableNetworkPriority {
-		err = utils.SetEgressPriority(parentLink, cfg.NetworkPriority, cfg.ContainerIPNet)
-		if err != nil {
-			return err
-		}
-	}
-
-	if cfg.StripVlan {
-		err = utils.EnsureVlanTag(parentLink, cfg.ContainerIPNet, uint16(cfg.Vid))
-		if err != nil {
-			return err
-		}
-	}
-
 	err = ipvlan.Setup(&ipvlan.IPVlan{
 		Parent:  parentLink.Attrs().Name,
 		PreName: cfg.HostVETHName,
@@ -293,17 +252,7 @@ func (d *IPvlanDriver) Setup(cfg *types.SetupConfig, netNS ns.NetNS) error {
 			return fmt.Errorf("error find link %s in container, %w", cfg.ContainerIfName, err)
 		}
 		contCfg := generateContCfgForIPVlan(cfg, contLink)
-		err = nic.Setup(contLink, contCfg)
-		if err != nil {
-			return err
-		}
-		if cfg.Egress == 0 && cfg.Ingress == 0 {
-			return nil
-		}
-		if cfg.BandwidthMode == "edt" {
-			return ensureFQ(contLink)
-		}
-		return utils.SetupTC(contLink, cfg.Egress)
+		return nic.Setup(contLink, contCfg)
 	})
 	if err != nil {
 		return fmt.Errorf("error set container link/address/route, %w", err)
@@ -318,34 +267,6 @@ func (d *IPvlanDriver) Setup(cfg *types.SetupConfig, netNS ns.NetNS) error {
 
 func (d *IPvlanDriver) Teardown(cfg *types.TeardownCfg, netNS ns.NetNS) error {
 	err := utils.DelLinkByName(cfg.HostVETHName)
-	if err != nil {
-		return err
-	}
-
-	if cfg.EnableNetworkPriority {
-		link, err := netlink.LinkByIndex(cfg.ENIIndex)
-		if err != nil {
-			if _, ok := err.(netlink.LinkNotFoundError); !ok {
-				return err
-			}
-		} else {
-			err = utils.DelEgressPriority(link, cfg.ContainerIPNet)
-			if err != nil {
-				return err
-			}
-		}
-	}
-
-	err = func() error {
-		link, err := netlink.LinkByIndex(cfg.ENIIndex)
-		if err != nil {
-			if _, ok := err.(netlink.LinkNotFoundError); !ok {
-				return err
-			}
-			return nil
-		}
-		return utils.DelFilter(link, netlink.HANDLE_MIN_EGRESS, cfg.ContainerIPNet)
-	}()
 	if err != nil {
 		return err
 	}
@@ -475,10 +396,7 @@ func (d *IPvlanDriver) setupFilters(link netlink.Link, cidrs []*net.IPNet, dstIn
 		if matchAny {
 			continue
 		}
-		if filter.Attrs() != nil && filter.Attrs().Priority != 4000 {
-			continue
-		}
-		if err := utils.FilterDel(filter); err != nil {
+		if err := netlink.FilterDel(filter); err != nil {
 			return fmt.Errorf("delete filter of %s error, %w", link.Attrs().Name, err)
 		}
 	}
@@ -487,7 +405,7 @@ func (d *IPvlanDriver) setupFilters(link netlink.Link, cidrs []*net.IPNet, dstIn
 		if !in {
 			u32 := rule.toU32Filter()
 			u32.Parent = parent
-			if err := utils.FilterAdd(u32); err != nil {
+			if err := netlink.FilterAdd(u32); err != nil {
 				return fmt.Errorf("add filter for %s error, %w", link.Attrs().Name, err)
 			}
 		}
@@ -741,39 +659,4 @@ func CheckIPVLanAvailable() (bool, error) {
 
 	return (major == ipVlanRequirementMajor && minor >= ipVlanRequirementMinor) ||
 		major > ipVlanRequirementMajor, nil
-}
-
-func ensureFQ(link netlink.Link) error {
-	fq := &netlink.GenericQdisc{
-		QdiscAttrs: netlink.QdiscAttrs{
-			LinkIndex: link.Attrs().Index,
-			Parent:    netlink.HANDLE_ROOT,
-			Handle:    netlink.MakeHandle(1, 0),
-		},
-		QdiscType: "fq",
-	}
-	qds, err := netlink.QdiscList(link)
-	if err != nil {
-		return err
-	}
-	found := false
-	for _, qd := range qds {
-		if qd.Attrs().LinkIndex != link.Attrs().Index {
-			continue
-		}
-		if qd.Type() != fq.Type() {
-			continue
-		}
-		if qd.Attrs().Parent != fq.Parent {
-			continue
-		}
-		if qd.Attrs().Handle != fq.Handle {
-			continue
-		}
-		found = true
-	}
-	if found {
-		return nil
-	}
-	return utils.QdiscReplace(fq)
 }

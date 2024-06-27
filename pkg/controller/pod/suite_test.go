@@ -1,4 +1,5 @@
 //go:build test_env
+// +build test_env
 
 package pod
 
@@ -10,10 +11,14 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/AliyunContainerService/terway/pkg/aliyun/client/fake"
+	networkv1beta1 "github.com/AliyunContainerService/terway/pkg/apis/network.alibabacloud.com/v1beta1"
+	register "github.com/AliyunContainerService/terway/pkg/controller"
+	"github.com/AliyunContainerService/terway/pkg/controller/vswitch"
+	"github.com/AliyunContainerService/terway/types/controlplane"
 	"github.com/aliyun/alibaba-cloud-sdk-go/services/vpc"
-	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
-	"github.com/stretchr/testify/mock"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -21,28 +26,22 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
+	"sigs.k8s.io/controller-runtime/pkg/envtest/printer"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
-
-	networkv1beta1 "github.com/AliyunContainerService/terway/pkg/apis/network.alibabacloud.com/v1beta1"
-	register "github.com/AliyunContainerService/terway/pkg/controller"
-	"github.com/AliyunContainerService/terway/pkg/controller/mocks"
-	"github.com/AliyunContainerService/terway/pkg/vswitch"
-	"github.com/AliyunContainerService/terway/types/controlplane"
 )
 
 var cfg *rest.Config
 var k8sClient client.Client
 var testEnv *envtest.Environment
 var tmpDir string
-var openAPI *mocks.Interface
 
 func TestAPIs(t *testing.T) {
 	RegisterFailHandler(Fail)
 
-	openAPI = mocks.NewInterface(t)
-
-	RunSpecs(t, "Controller Suite")
+	RunSpecsWithDefaultAndCustomReporters(t,
+		"Controller Suite",
+		[]Reporter{printer.NewlineReporter{}})
 }
 
 var _ = BeforeSuite(func() {
@@ -100,27 +99,24 @@ var _ = BeforeSuite(func() {
 	vsw, err := vswitch.NewSwitchPool(1000, "100m")
 	Expect(err).ToNot(HaveOccurred())
 
-	openAPI.On("DescribeVSwitchByID", mock.Anything, "vsw-az-1-no-ip").Return(&vpc.VSwitch{
-		VSwitchId:               "vsw-az-1-no-ip",
-		ZoneId:                  "az-1",
-		AvailableIpAddressCount: 0,
-	}, nil).Maybe()
-	openAPI.On("DescribeVSwitchByID", mock.Anything, "vsw-az-1").Return(&vpc.VSwitch{
-		VSwitchId:               "vsw-az-1",
-		ZoneId:                  "az-1",
-		AvailableIpAddressCount: 100,
-	}, nil).Maybe()
-	openAPI.On("DescribeVSwitchByID", mock.Anything, "vsw-az-2").Return(&vpc.VSwitch{
-		VSwitchId:               "vsw-az-2",
-		ZoneId:                  "az-2",
-		AvailableIpAddressCount: 100,
-	}, nil).Maybe()
-
-	err = register.Controllers[controllerName].Creator(k8sManager, &register.ControllerCtx{
-		Config:       &controlplane.Config{},
-		VSwitchPool:  vsw,
-		AliyunClient: openAPI,
-	})
+	fakeClient := &fake.OpenAPI{
+		VSwitches: map[string]vpc.VSwitch{
+			"vsw-az-1-no-ip": {
+				VSwitchId:               "vsw-az-1-no-ip",
+				ZoneId:                  "az-1",
+				AvailableIpAddressCount: 0,
+			}, "vsw-az-1": {
+				VSwitchId:               "vsw-az-1",
+				ZoneId:                  "az-1",
+				AvailableIpAddressCount: 100,
+			}, "vsw-az-2": {
+				VSwitchId:               "vsw-az-2",
+				ZoneId:                  "az-2",
+				AvailableIpAddressCount: 100,
+			},
+		},
+	}
+	err = register.Controllers[controllerName](k8sManager, fakeClient, vsw)
 	Expect(err).ToNot(HaveOccurred())
 
 	go func() {

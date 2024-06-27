@@ -4,10 +4,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
+	"io/ioutil"
 	"net"
 	"net/http"
-	"net/netip"
 	"strings"
 	"time"
 
@@ -52,18 +51,18 @@ func getValue(url string) (string, error) {
 	}()
 	resp, err := http.DefaultClient.Get(url)
 	if err != nil {
-		return "", fmt.Errorf("error get url: %s from metaserver. %w", url, err)
+		return "", err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound {
-		return "", fmt.Errorf("error get url: %s from metaserver, code: %v, %w", url, resp.StatusCode, apiErr.ErrNotFound)
+		return "", apiErr.ErrNotFound
 	}
 	if resp.StatusCode >= http.StatusBadRequest {
 		return "", fmt.Errorf("error get url: %s from metaserver, code: %v", url, resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		return "", err
 	}
@@ -86,18 +85,18 @@ func getArray(url string) ([]string, error) {
 
 	resp, err := http.DefaultClient.Get(url)
 	if err != nil {
-		return []string{}, fmt.Errorf("error get url: %s from metaserver. %w", url, err)
+		return []string{}, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound {
-		return []string{}, fmt.Errorf("error get url: %s from metaserver, code: %v, %w", url, resp.StatusCode, apiErr.ErrNotFound)
+		return nil, apiErr.ErrNotFound
 	}
 	if resp.StatusCode >= http.StatusBadRequest {
 		return []string{}, fmt.Errorf("error get url: %s from metaserver, code: %v", url, resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		return []string{}, err
 	}
@@ -158,15 +157,6 @@ func GetENIPrimaryIP(mac string) (net.IP, error) {
 	return ip.ToIP(addr)
 }
 
-// GetENIPrimaryAddr by mac
-func GetENIPrimaryAddr(mac string) (netip.Addr, error) {
-	addr, err := getValue(fmt.Sprintf(metadataBase+eniAddrPath, mac))
-	if err != nil {
-		return netip.Addr{}, err
-	}
-	return netip.ParseAddr(addr)
-}
-
 // GetENIPrivateIPs by mac
 func GetENIPrivateIPs(mac string) ([]net.IP, error) {
 	addressStrList := &[]string{}
@@ -187,20 +177,6 @@ func GetENIPrivateIPs(mac string) ([]net.IP, error) {
 		ips = append(ips, i)
 	}
 	return ips, nil
-}
-
-func GetIPv4ByMac(mac string) ([]netip.Addr, error) {
-	addressStrList := &[]string{}
-	ipsStr, err := getValue(fmt.Sprintf(metadataBase+eniPrivateIPs, mac))
-	if err != nil {
-		return nil, err
-	}
-	err = json.Unmarshal([]byte(ipsStr), addressStrList)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse ip, %s, %w", ipsStr, err)
-	}
-
-	return ip.ToIPAddrs(*addressStrList)
 }
 
 // GetENIPrivateIPv6IPs by mac return [2408::28eb]
@@ -228,31 +204,6 @@ func GetENIPrivateIPv6IPs(mac string) ([]net.IP, error) {
 	return ips, nil
 }
 
-// GetIPv6ByMac by mac return [2408::28eb]
-func GetIPv6ByMac(mac string) ([]netip.Addr, error) {
-	ipsStr, err := getValue(fmt.Sprintf(metadataBase+eniPrivateV6IPs, mac))
-	if err != nil {
-		// metadata return 404 when no ipv6 is allocated
-		if errors.Is(err, apiErr.ErrNotFound) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	ipsStr = strings.ReplaceAll(ipsStr, "[", "")
-	ipsStr = strings.ReplaceAll(ipsStr, "]", "")
-
-	var result []netip.Addr
-	for _, addr := range strings.Split(ipsStr, ",") {
-		i, err := netip.ParseAddr(strings.TrimSpace(addr))
-		if err != nil {
-			return nil, err
-		}
-		result = append(result, i)
-	}
-
-	return result, nil
-}
-
 // GetENIGateway return gateway ip by mac
 func GetENIGateway(mac string) (net.IP, error) {
 	addr, err := getValue(fmt.Sprintf(metadataBase+eniGatewayPath, mac))
@@ -260,15 +211,6 @@ func GetENIGateway(mac string) (net.IP, error) {
 		return nil, err
 	}
 	return ip.ToIP(addr)
-}
-
-// GetENIGatewayAddr return gateway ip by mac
-func GetENIGatewayAddr(mac string) (netip.Addr, error) {
-	addr, err := getValue(fmt.Sprintf(metadataBase+eniGatewayPath, mac))
-	if err != nil {
-		return netip.Addr{}, err
-	}
-	return netip.ParseAddr(addr)
 }
 
 // GetVSwitchCIDR return vSwitch cidr by mac
@@ -284,15 +226,6 @@ func GetVSwitchCIDR(mac string) (*net.IPNet, error) {
 	return ipNet, nil
 }
 
-// GetVSwitchPrefix return vSwitch cidr by mac
-func GetVSwitchPrefix(mac string) (netip.Prefix, error) {
-	addr, err := getValue(fmt.Sprintf(metadataBase+eniVSwitchCIDRPath, mac))
-	if err != nil {
-		return netip.Prefix{}, err
-	}
-	return netip.ParsePrefix(addr)
-}
-
 // GetVSwitchIPv6CIDR return vSwitch cidr by mac
 func GetVSwitchIPv6CIDR(mac string) (*net.IPNet, error) {
 	addr, err := getValue(fmt.Sprintf(metadataBase+eniVSwitchIPv6CIDRPath, mac))
@@ -306,15 +239,6 @@ func GetVSwitchIPv6CIDR(mac string) (*net.IPNet, error) {
 	return ipNet, nil
 }
 
-// GetVSwitchIPv6Prefix return vSwitch cidr by mac
-func GetVSwitchIPv6Prefix(mac string) (netip.Prefix, error) {
-	addr, err := getValue(fmt.Sprintf(metadataBase+eniVSwitchIPv6CIDRPath, mac))
-	if err != nil {
-		return netip.Prefix{}, err
-	}
-	return netip.ParsePrefix(addr)
-}
-
 // GetENIV6Gateway return gateway ip by mac
 func GetENIV6Gateway(mac string) (net.IP, error) {
 	addr, err := getValue(fmt.Sprintf(metadataBase+eniV6GatewayPath, mac))
@@ -322,15 +246,6 @@ func GetENIV6Gateway(mac string) (net.IP, error) {
 		return nil, err
 	}
 	return ip.ToIP(addr)
-}
-
-// GetENIV6GatewayAddr return gateway ip by mac
-func GetENIV6GatewayAddr(mac string) (netip.Addr, error) {
-	addr, err := getValue(fmt.Sprintf(metadataBase+eniV6GatewayPath, mac))
-	if err != nil {
-		return netip.Addr{}, err
-	}
-	return netip.ParseAddr(addr)
 }
 
 // GetENIVSwitchID by mac

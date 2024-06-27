@@ -3,9 +3,8 @@ package credential
 import (
 	"time"
 
-	"github.com/aliyun/alibaba-cloud-sdk-go/sdk/auth"
-
 	"github.com/AliyunContainerService/terway/pkg/logger"
+	"github.com/aliyun/alibaba-cloud-sdk-go/sdk/auth"
 )
 
 var log = logger.DefaultLogger.WithField("subSys", "credential")

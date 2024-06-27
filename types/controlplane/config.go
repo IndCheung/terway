@@ -18,27 +18,40 @@ package controlplane
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"os"
+	"sync"
+
+	"github.com/AliyunContainerService/terway/pkg/aliyun/metadata"
+	"github.com/AliyunContainerService/terway/pkg/backoff"
 
 	"github.com/go-playground/mold/v4/modifiers"
 	"github.com/go-playground/validator/v10"
 	"k8s.io/apimachinery/pkg/util/yaml"
-
-	"github.com/AliyunContainerService/terway/pkg/aliyun/metadata"
-	"github.com/AliyunContainerService/terway/pkg/backoff"
 )
 
 var (
-	cfg *Config
+	config     string
+	credential string
+	cfg        *Config
+	once       sync.Once
 )
 
-func GetConfig() *Config {
-	return cfg
+func init() {
+	flag.StringVar(&config, "config", "/etc/config/ctrl-config.yaml", "config file for controlplane")
+	flag.StringVar(&credential, "credential", "/etc/credential/ctrl-secret.yaml", "secret file for controlplane")
 }
 
-func SetConfig(c *Config) {
-	cfg = c
+func GetConfig() *Config {
+	once.Do(func() {
+		var err error
+		cfg, err = ParseAndValidate()
+		if err != nil {
+			panic(err)
+		}
+	})
+	return cfg
 }
 
 func ParseAndValidateCredential(file string) (*Credential, error) {
@@ -58,8 +71,8 @@ func ParseAndValidateCredential(file string) (*Credential, error) {
 }
 
 // ParseAndValidate ready config and verify it
-func ParseAndValidate(configFilePath, credentialFilePath string) (*Config, error) {
-	b, err := os.ReadFile(configFilePath)
+func ParseAndValidate() (*Config, error) {
+	b, err := os.ReadFile(config)
 	if err != nil {
 		return nil, err
 	}
@@ -70,7 +83,7 @@ func ParseAndValidate(configFilePath, credentialFilePath string) (*Config, error
 		return nil, err
 	}
 
-	cr, err := ParseAndValidateCredential(credentialFilePath)
+	cr, err := ParseAndValidateCredential(credential)
 	if err != nil {
 		return nil, err
 	}
@@ -86,15 +99,12 @@ func ParseAndValidate(configFilePath, credentialFilePath string) (*Config, error
 		t := true
 		c.EnableTrunk = &t
 	}
+
 	if c.RegionID == "" {
 		c.RegionID, err = metadata.GetLocalRegion()
 		if err != nil || c.RegionID == "" {
 			return nil, fmt.Errorf("error get region from metadata %v", err)
 		}
-	}
-
-	if c.RegisterEndpoint {
-		c.Controllers = append(c.Controllers, "endpoint")
 	}
 
 	err = validator.New().Struct(&c)
@@ -103,23 +113,8 @@ func ParseAndValidate(configFilePath, credentialFilePath string) (*Config, error
 	}
 
 	backoff.OverrideBackoff(c.BackoffOverride)
+
 	cfg = &c
 
 	return &c, nil
-}
-
-// IsControllerEnabled check if a specified controller enabled or not.
-func IsControllerEnabled(name string, enable bool, controllers []string) bool {
-	for _, ctrl := range controllers {
-		if ctrl == name {
-			return true
-		}
-		if ctrl == "-"+name {
-			return false
-		}
-		if ctrl == "*" {
-			return true
-		}
-	}
-	return enable
 }

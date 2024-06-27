@@ -1,4 +1,5 @@
 //go:build default_build
+// +build default_build
 
 /*
 Copyright 2021 Terway Authors.
@@ -33,30 +34,22 @@ type Config struct {
 
 	HealthzBindAddress string `json:"healthzBindAddress" validate:"required,tcp_addr" mod:"default=0.0.0.0:80"`
 	MetricsBindAddress string `json:"metricsBindAddress" validate:"required" mod:"default=0"`
-	ClusterDomain      string `json:"clusterDomain" validate:"required" mod:"default=cluster.local"`
-	DisableWebhook     bool   `json:"disableWebhook"`
+	ClusterDomain      string `json:"clusterDomain" validate:"required,fqdn" mod:"default=cluster.local"`
 	WebhookPort        int    `json:"webhookPort" validate:"gt=0,lte=65535" mod:"default=4443"`
 	CertDir            string `json:"certDir" validate:"required" mod:"default=/var/run/webhook-cert"`
 	LeaderElection     bool   `json:"leaderElection"`
-	RegisterEndpoint   bool   `json:"registerEndpoint"` // deprecated
+	RegisterEndpoint   bool   `json:"registerEndpoint"`
 
-	NodeMaxConcurrent   int `json:"nodeMaxConcurrent" validate:"gt=0,lte=10000" mod:"default=10"`
 	PodMaxConcurrent    int `json:"podMaxConcurrent" validate:"gt=0,lte=10000" mod:"default=10"`
 	PodENIMaxConcurrent int `json:"podENIMaxConcurrent" validate:"gt=0,lte=10000" mod:"default=10"`
-
-	Controllers []string `json:"controllers"`
 
 	// cluster info for controlplane
 	RegionID  string `json:"regionID" validate:"required"`
 	ClusterID string `json:"clusterID" validate:"required"`
 	VPCID     string `json:"vpcID" validate:"required"`
 
-	EnableTrunk        *bool  `json:"enableTrunk,omitempty"`
-	EnableDevicePlugin bool   `json:"enableDevicePlugin"`
-	IPStack            string `json:"ipStack,omitempty" validate:"oneof=ipv4 ipv6 dual" mod:"default=ipv4"`
-
-	KubeClientQPS   float32 `json:"kubeClientQPS" validate:"gt=0,lte=10000" mod:"default=20"`
-	KubeClientBurst int     `json:"kubeClientBurst" validate:"gt=0,lte=10000" mod:"default=30"`
+	EnableTrunk *bool  `json:"enableTrunk,omitempty"`
+	IPStack     string `json:"ipStack,omitempty" validate:"oneof=ipv4 ipv6 dual" mod:"default=ipv4"`
 
 	ReadOnlyQPS   float32 `json:"readOnlyQPS" validate:"gt=0,lte=10000" mod:"default=8"`
 	ReadOnlyBurst int     `json:"readOnlyBurst" validate:"gt=0,lte=10000" mod:"default=10"`

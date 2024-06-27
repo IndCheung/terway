@@ -1,1518 +1,1637 @@
 package daemon
 
 import (
-	"context"
-	"encoding/binary"
-	"encoding/json"
-	"errors"
-	"fmt"
-	"net"
-	"net/netip"
-	"os"
-	"strconv"
-	"strings"
-	"sync"
-	"time"
+    "context"
+    "encoding/json"
+    "fmt"
+    "io/ioutil"
+    "net"
+    "os"
+    "path/filepath"
+    "sort"
+    "strings"
+    "sync"
+    "time"
 
-	"github.com/vishvananda/netlink"
-	"k8s.io/apimachinery/pkg/util/sets"
-	logf "sigs.k8s.io/controller-runtime/pkg/log"
-
-	"github.com/AliyunContainerService/terway/deviceplugin"
-	"github.com/AliyunContainerService/terway/pkg/aliyun/client"
-	"github.com/AliyunContainerService/terway/pkg/aliyun/credential"
-	eni2 "github.com/AliyunContainerService/terway/pkg/aliyun/eni"
-	"github.com/AliyunContainerService/terway/pkg/aliyun/instance"
-	"github.com/AliyunContainerService/terway/pkg/apis/alibabacloud.com/v1beta1"
-	"github.com/AliyunContainerService/terway/pkg/apis/crds"
-	"github.com/AliyunContainerService/terway/pkg/backoff"
-	"github.com/AliyunContainerService/terway/pkg/eni"
-	"github.com/AliyunContainerService/terway/pkg/factory"
-	"github.com/AliyunContainerService/terway/pkg/factory/aliyun"
-	"github.com/AliyunContainerService/terway/pkg/k8s"
-	"github.com/AliyunContainerService/terway/pkg/metric"
-	"github.com/AliyunContainerService/terway/pkg/storage"
-	"github.com/AliyunContainerService/terway/pkg/tracing"
-	"github.com/AliyunContainerService/terway/pkg/utils"
-	"github.com/AliyunContainerService/terway/pkg/utils/nodecap"
-	vswpool "github.com/AliyunContainerService/terway/pkg/vswitch"
-	"github.com/AliyunContainerService/terway/rpc"
-	"github.com/AliyunContainerService/terway/types"
-	"github.com/AliyunContainerService/terway/types/daemon"
-
-	"github.com/samber/lo"
-	corev1 "k8s.io/api/core/v1"
-	k8sErr "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	k8stypes "k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/client-go/util/flowcontrol"
-	"k8s.io/client-go/util/retry"
+    "github.com/AliyunContainerService/terway/pkg/aliyun"
+    "github.com/AliyunContainerService/terway/pkg/aliyun/client"
+    podENITypes "github.com/AliyunContainerService/terway/pkg/apis/network.alibabacloud.com/v1beta1"
+    "github.com/AliyunContainerService/terway/pkg/backoff"
+    terwayIP "github.com/AliyunContainerService/terway/pkg/ip"
+    "github.com/AliyunContainerService/terway/pkg/ipam"
+    "github.com/AliyunContainerService/terway/pkg/link"
+    "github.com/AliyunContainerService/terway/pkg/logger"
+    "github.com/AliyunContainerService/terway/pkg/metric"
+    "github.com/AliyunContainerService/terway/pkg/pool"
+    "github.com/AliyunContainerService/terway/pkg/storage"
+    "github.com/AliyunContainerService/terway/pkg/tracing"
+    "github.com/AliyunContainerService/terway/pkg/utils"
+    "github.com/AliyunContainerService/terway/rpc"
+    "github.com/AliyunContainerService/terway/types"
+    "github.com/containernetworking/cni/libcni"
+    containertypes "github.com/containernetworking/cni/pkg/types"
+    "github.com/pkg/errors"
+    corev1 "k8s.io/api/core/v1"
+    k8sErr "k8s.io/apimachinery/pkg/api/errors"
 )
 
 const (
-	gcPeriod = 5 * time.Minute
+    daemonModeVPC        = "VPC"
+    daemonModeENIMultiIP = "ENIMultiIP"
+    daemonModeENIOnly    = "ENIOnly"
 
-	networkServiceName       = "default"
-	tracingKeyName           = "name"
-	tracingKeyDaemonMode     = "daemon_mode"
-	tracingKeyConfigFilePath = "config_file_path"
+    gcPeriod        = 5 * time.Minute
+    poolCheckPeriod = 10 * time.Minute
 
-	tracingKeyPendingPodsCount = "pending_pods_count"
+    conditionFalse = "false"
+    conditionTrue  = "true"
 
-	commandMapping = "mapping"
-	commandResDB   = "resdb"
+    networkServiceName         = "default"
+    tracingKeyName             = "name"
+    tracingKeyDaemonMode       = "daemon_mode"
+    tracingKeyConfigFilePath   = "config_file_path"
+    tracingKeyKubeConfig       = "kubeconfig"
+    tracingKeyMaster           = "master"
+    tracingKeyPendingPodsCount = "pending_pods_count"
 
-	IfEth0 = "eth0"
+    commandMapping = "mapping"
 
-	envEFLO = "eflo"
+    cniDefaultPath = "/opt/cni/bin"
+    // this file is generated from configmap
+    terwayCNIConf  = "/etc/eni/10-terway.conf"
+    cniExecTimeout = 10 * time.Second
 )
 
 type networkService struct {
-	daemonMode     string
-	configFilePath string
+    daemonMode     string
+    configFilePath string
+    kubeConfig     string
+    master         string
+    k8s            Kubernetes
+    resourceDB     storage.Storage
+    vethResMgr     ResourceManager
+    eniResMgr      ResourceManager
+    eniIPResMgr    ResourceManager
+    eipResMgr      ResourceManager
+    //networkResourceMgr ResourceManager
+    mgrForResource map[string]ResourceManager
+    pendingPods    sync.Map
+    sync.RWMutex
 
-	k8s        k8s.Kubernetes
-	resourceDB storage.Storage
+    cniBinPath string
 
-	eniMgr      *eni.Manager
-	pendingPods sync.Map
-	sync.RWMutex
+    enableTrunk bool
 
-	enableIPv4, enableIPv6 bool
+    ipFamily     *types.IPFamily
+    ipamType     types.IPAMType
+    eniCapPolicy types.ENICapPolicy
 
-	ipamType types.IPAMType
-
-	wg sync.WaitGroup
-
-	gcRulesOnce sync.Once
-
-	rpc.UnimplementedTerwayBackendServer
+    rpc.UnimplementedTerwayBackendServer
 }
 
-var serviceLog = logf.Log.WithName("server")
+var serviceLog = logger.DefaultLogger.WithField("subSys", "network-service")
 
 var _ rpc.TerwayBackendServer = (*networkService)(nil)
 
-// return resource relation in db, or return nil.
-func (n *networkService) getPodResource(info *daemon.PodInfo) (daemon.PodResources, error) {
-	obj, err := n.resourceDB.Get(utils.PodInfoKey(info.Namespace, info.Name))
-	if err == nil {
-		return obj.(daemon.PodResources), nil
-	}
-	if errors.Is(err, storage.ErrNotFound) {
-		return daemon.PodResources{}, nil
-	}
-
-	return daemon.PodResources{}, err
+func (n *networkService) getResourceManagerForRes(resType string) ResourceManager {
+    return n.mgrForResource[resType]
 }
 
-func (n *networkService) deletePodResource(info *daemon.PodInfo) error {
-	key := utils.PodInfoKey(info.Namespace, info.Name)
-	return n.resourceDB.Delete(key)
+//return resource relation in db, or return nil.
+func (n *networkService) getPodResource(info *types.PodInfo) (types.PodResources, error) {
+    obj, err := n.resourceDB.Get(podInfoKey(info.Namespace, info.Name))
+    if err == nil {
+        return obj.(types.PodResources), nil
+    }
+    if err == storage.ErrNotFound {
+        return types.PodResources{}, nil
+    }
+
+    return types.PodResources{}, err
+}
+
+func (n *networkService) deletePodResource(info *types.PodInfo) error {
+    key := podInfoKey(info.Namespace, info.Name)
+    return n.resourceDB.Delete(key)
+}
+
+func (n *networkService) allocateVeth(ctx *networkContext, old *types.PodResources) (*types.Veth, error) {
+    oldVethRes := old.GetResourceItemByType(types.ResourceTypeVeth)
+    oldVethID := ""
+    if old.PodInfo != nil {
+        if len(oldVethRes) == 0 {
+            ctx.Log().Debugf("veth for pod %s is zero", podInfoKey(old.PodInfo.Namespace, old.PodInfo.Name))
+        } else if len(oldVethRes) > 1 {
+            ctx.Log().Warnf("veth for pod %s is more than one", podInfoKey(old.PodInfo.Namespace, old.PodInfo.Name))
+        } else {
+            oldVethID = oldVethRes[0].ID
+        }
+    }
+
+    res, err := n.vethResMgr.Allocate(ctx, oldVethID)
+    if err != nil {
+        return nil, err
+    }
+    return res.(*types.Veth), nil
+}
+
+func (n *networkService) allocateENI(ctx *networkContext, old *types.PodResources) (*types.ENI, error) {
+    oldENIRes := old.GetResourceItemByType(types.ResourceTypeENI)
+    oldENIID := ""
+    if old.PodInfo != nil {
+        if len(oldENIRes) == 0 {
+            ctx.Log().Debugf("eniip for pod %s is zero", podInfoKey(old.PodInfo.Namespace, old.PodInfo.Name))
+        } else if len(oldENIRes) > 1 {
+            ctx.Log().Warnf("eniip for pod %s is more than one", podInfoKey(old.PodInfo.Namespace, old.PodInfo.Name))
+        } else {
+            oldENIID = oldENIRes[0].ID
+        }
+    }
+
+    res, err := n.eniResMgr.Allocate(ctx, oldENIID)
+    if err != nil {
+        return nil, err
+    }
+    return res.(*types.ENI), nil
+}
+
+func (n *networkService) allocateENIMultiIP(ctx *networkContext, old *types.PodResources) (*types.ENIIP, error) {
+    oldENIIPRes := old.GetResourceItemByType(types.ResourceTypeENIIP)
+    oldENIIPID := ""
+    if old.PodInfo != nil {
+        if len(oldENIIPRes) == 0 {
+            ctx.Log().Debugf("eniip for pod %s is zero", podInfoKey(old.PodInfo.Namespace, old.PodInfo.Name))
+        } else if len(oldENIIPRes) > 1 {
+            ctx.Log().Warnf("eniip for pod %s is more than one", podInfoKey(old.PodInfo.Namespace, old.PodInfo.Name))
+        } else {
+            oldENIIPID = oldENIIPRes[0].ID
+        }
+    }
+
+    res, err := n.eniIPResMgr.Allocate(ctx, oldENIIPID)
+    if err != nil {
+        return nil, err
+    }
+    return res.(*types.ENIIP), nil
+}
+
+func (n *networkService) allocateEIP(ctx *networkContext, old *types.PodResources) (*types.EIP, error) {
+    oldEIPRes := old.GetResourceItemByType(types.ResourceTypeEIP)
+    oldEIPID := ""
+    if old.PodInfo != nil {
+        if len(oldEIPRes) == 0 {
+            ctx.Log().Debugf("eip for pod %s is zero", podInfoKey(old.PodInfo.Namespace, old.PodInfo.Name))
+        } else if len(oldEIPRes) > 1 {
+            ctx.Log().Warnf("eip for pod %s is more than one", podInfoKey(old.PodInfo.Namespace, old.PodInfo.Name))
+        } else {
+            oldEIPID = oldEIPRes[0].ID
+        }
+    }
+
+    res, err := n.eipResMgr.Allocate(ctx, oldEIPID)
+    if err != nil {
+        return nil, err
+    }
+    return res.(*types.EIP), nil
 }
 
 func (n *networkService) AllocIP(ctx context.Context, r *rpc.AllocIPRequest) (*rpc.AllocIPReply, error) {
-	podID := utils.PodInfoKey(r.K8SPodNamespace, r.K8SPodName)
-	l := logf.FromContext(ctx)
-	l.Info("alloc ip req")
+    serviceLog.WithFields(map[string]interface{}{
+        "pod":         podInfoKey(r.K8SPodNamespace, r.K8SPodName),
+        "containerID": r.K8SPodInfraContainerId,
+        "netNS":       r.Netns,
+        "ifName":      r.IfName,
+    }).Info("alloc ip req")
 
-	_, exist := n.pendingPods.LoadOrStore(podID, struct{}{})
-	if exist {
-		return nil, &types.Error{
-			Code: types.ErrPodIsProcessing,
-			Msg:  fmt.Sprintf("Pod %s request is processing", podID),
-		}
-	}
-	defer func() {
-		n.pendingPods.Delete(podID)
-	}()
+    _, exist := n.pendingPods.LoadOrStore(podInfoKey(r.K8SPodNamespace, r.K8SPodName), struct{}{})
+    if exist {
+        return nil, fmt.Errorf("pod %s resource processing", podInfoKey(r.K8SPodNamespace, r.K8SPodName))
+    }
+    defer func() {
+        n.pendingPods.Delete(podInfoKey(r.K8SPodNamespace, r.K8SPodName))
+    }()
 
-	n.RLock()
-	defer n.RUnlock()
-	var (
-		start = time.Now()
-		err   error
-	)
+    n.RLock()
+    defer n.RUnlock()
+    var (
+        start = time.Now()
+        err   error
+    )
+    defer func() {
+        metric.RPCLatency.WithLabelValues("AllocIP", fmt.Sprint(err != nil)).Observe(metric.MsSince(start))
+    }()
 
-	reply := &rpc.AllocIPReply{
-		Success: true,
-		IPv4:    n.enableIPv4,
-		IPv6:    n.enableIPv6,
-	}
+    // 0. Get pod Info
+    podinfo, err := n.k8s.GetPod(r.K8SPodNamespace, r.K8SPodName)
+    if err != nil {
+        return nil, errors.Wrapf(err, "error get pod info for: %+v", r)
+    }
 
-	defer func() {
-		metric.RPCLatency.WithLabelValues("AllocIP", fmt.Sprint(err != nil)).Observe(metric.MsSince(start))
+    // 1. Init Context
+    networkContext := &networkContext{
+        Context:    ctx,
+        resources:  []types.ResourceItem{},
+        pod:        podinfo,
+        k8sService: n.k8s,
+    }
+    allocIPReply := &rpc.AllocIPReply{IPv4: n.ipFamily.IPv4, IPv6: n.ipFamily.IPv6}
 
-		l.Info("alloc ip", "reply", fmt.Sprintf("%v", reply), "err", fmt.Sprintf("%v", err))
-	}()
+    defer func() {
+        // roll back allocated resource when error
+        if err != nil {
+            networkContext.Log().Errorf("alloc result with error, %+v", err)
+            for _, res := range networkContext.resources {
+                err = n.deletePodResource(podinfo)
+                networkContext.Log().Errorf("rollback res[%v] with error, %+v", res, err)
+                mgr := n.getResourceManagerForRes(res.Type)
+                if mgr == nil {
+                    networkContext.Log().Warnf("error cleanup allocated network resource %s, %s: %v", res.ID, res.Type, err)
+                    continue
+                }
+                err = mgr.Release(networkContext, res)
+                if err != nil {
+                    networkContext.Log().Infof("rollback res error: %+v", err)
+                }
+            }
+        } else {
+            networkContext.Log().Infof("alloc result: %+v", allocIPReply)
+        }
+    }()
 
-	// 0. Get pod Info
-	pod, err := n.k8s.GetPod(ctx, r.K8SPodNamespace, r.K8SPodName, true)
-	if err != nil {
-		return nil, &types.Error{
-			Code: types.ErrInvalidArgsErrCode,
-			Msg:  err.Error(),
-			R:    err,
-		}
-	}
+    // 2. Find old resource info
+    oldRes, err := n.getPodResource(podinfo)
+    if err != nil {
+        return nil, errors.Wrapf(err, "error get pod resources from db for pod %+v", podinfo)
+    }
 
-	// 1. Init Context
+    if !n.verifyPodNetworkType(podinfo.PodNetworkType) {
+        return nil, fmt.Errorf("unexpect pod network type allocate, maybe daemon mode changed: %+v", podinfo.PodNetworkType)
+    }
+    var netConf []*rpc.NetConf
+    // 3. Allocate network resource for pod
+    switch podinfo.PodNetworkType {
+    case podNetworkTypeENIMultiIP:
+        allocIPReply.IPType = rpc.IPType_TypeENIMultiIP
+        var netConfs []*rpc.NetConf
+        netConfs, err = n.multiIPFromCRD(podinfo, true)
+        if err != nil {
+            return nil, err
+        }
+        netConf = append(netConf, netConfs...)
 
-	cni := &daemon.CNI{
-		PodName:      r.K8SPodName,
-		PodNamespace: r.K8SPodNamespace,
-		PodID:        podID,
-		PodUID:       pod.PodUID,
-		NetNSPath:    r.Netns,
-	}
+        defaultIfSet := false
+        for _, cfg := range netConf {
+            if defaultIf(cfg.IfName) {
+                defaultIfSet = true
+            }
+        }
+        if !defaultIfSet {
+            // alloc eniip
+            var eniIP *types.ENIIP
+            eniIP, err = n.allocateENIMultiIP(networkContext, &oldRes)
+            if err != nil {
+                return nil, fmt.Errorf("error get allocated eniip ip for: %+v, result: %+v", podinfo, err)
+            }
+            newRes := types.PodResources{
+                PodInfo:   podinfo,
+                Resources: eniIP.ToResItems(),
+                NetNs: func(s string) *string {
+                    return &s
+                }(r.Netns),
+            }
+            networkContext.resources = append(networkContext.resources, newRes.Resources...)
+            if n.eipResMgr != nil && podinfo.EipInfo.PodEip {
+                podinfo.PodIPs = eniIP.IPSet
+                var eipRes *types.EIP
+                eipRes, err = n.allocateEIP(networkContext, &oldRes)
+                if err != nil {
+                    return nil, fmt.Errorf("error get allocated eip for: %+v, result: %+v", podinfo, err)
+                }
+                eipResItem := eipRes.ToResItems()
+                newRes.Resources = append(newRes.Resources, eipResItem...)
+                networkContext.resources = append(networkContext.resources, eipResItem...)
+            }
+            err = n.resourceDB.Put(podInfoKey(podinfo.Namespace, podinfo.Name), newRes)
+            if err != nil {
+                return nil, errors.Wrapf(err, "error put resource into store")
+            }
 
-	// 2. Find old resource info
-	oldRes, err := n.getPodResource(pod)
-	if err != nil {
-		return nil, &types.Error{
-			Code: types.ErrInternalError,
-			Msg:  err.Error(),
-			R:    err,
-		}
-	}
+            netConf = append(netConf, &rpc.NetConf{
+                BasicInfo: &rpc.BasicInfo{
+                    PodIP:       eniIP.IPSet.ToRPC(),
+                    PodCIDR:     eniIP.ENI.VSwitchCIDR.ToRPC(),
+                    GatewayIP:   eniIP.ENI.GatewayIP.ToRPC(),
+                    ServiceCIDR: n.k8s.GetServiceCIDR().ToRPC(),
+                },
+                ENIInfo: &rpc.ENIInfo{
+                    MAC:   eniIP.ENI.MAC,
+                    Trunk: false,
+                },
+                Pod: &rpc.Pod{
+                    Ingress: podinfo.TcIngress,
+                    Egress:  podinfo.TcEgress,
+                },
+                IfName:       "",
+                ExtraRoutes:  nil,
+                DefaultRoute: true,
+            })
+        }
 
-	if !n.verifyPodNetworkType(pod.PodNetworkType) {
-		return nil, &types.Error{
-			Code: types.ErrInvalidArgsErrCode,
-			Msg:  "Unexpected network type, maybe daemon mode changed",
-		}
-	}
+        err = defaultForNetConf(netConf)
+        if err != nil {
+            return nil, err
+        }
+        allocIPReply.Success = true
+    case podNetworkTypeVPCENI:
+        allocIPReply.IPType = rpc.IPType_TypeVPCENI
+        if n.ipamType == types.IPAMTypeCRD {
+            var netConfs []*rpc.NetConf
+            netConfs, err = n.exclusiveENIFromCRD(podinfo, true)
+            if err != nil {
+                return nil, err
+            }
+            netConf = append(netConf, netConfs...)
+        } else {
+            var eni *types.ENI
+            eni, err = n.allocateENI(networkContext, &oldRes)
+            if err != nil {
+                return nil, fmt.Errorf("error get allocated vpc ENI ip for: %+v, result: %+v", podinfo, err)
+            }
+            newRes := types.PodResources{
+                PodInfo:   podinfo,
+                Resources: eni.ToResItems(),
+                NetNs: func(s string) *string {
+                    return &s
+                }(r.Netns),
+            }
+            networkContext.resources = append(networkContext.resources, newRes.Resources...)
+            if n.eipResMgr != nil && podinfo.EipInfo.PodEip {
+                podinfo.PodIPs = eni.PrimaryIP
+                var eipRes *types.EIP
+                eipRes, err = n.allocateEIP(networkContext, &oldRes)
+                if err != nil {
+                    return nil, fmt.Errorf("error get allocated eip for: %+v, result: %+v", podinfo, err)
+                }
+                eipResItem := eipRes.ToResItems()
+                newRes.Resources = append(newRes.Resources, eipResItem...)
+                networkContext.resources = append(networkContext.resources, eipResItem...)
+            }
+            err = n.resourceDB.Put(podInfoKey(podinfo.Namespace, podinfo.Name), newRes)
+            if err != nil {
+                return nil, errors.Wrapf(err, "error put resource into store")
+            }
+            netConf = append(netConf, &rpc.NetConf{
+                BasicInfo: &rpc.BasicInfo{
+                    PodIP:       eni.PrimaryIP.ToRPC(),
+                    PodCIDR:     eni.VSwitchCIDR.ToRPC(),
+                    GatewayIP:   eni.GatewayIP.ToRPC(),
+                    ServiceCIDR: n.k8s.GetServiceCIDR().ToRPC(),
+                },
+                ENIInfo: &rpc.ENIInfo{
+                    MAC:   eni.MAC,
+                    Trunk: false,
+                },
+                Pod: &rpc.Pod{
+                    Ingress: podinfo.TcIngress,
+                    Egress:  podinfo.TcEgress,
+                },
+                IfName:       "",
+                ExtraRoutes:  nil,
+                DefaultRoute: true,
+            })
+        }
+        allocIPReply.Success = true
+    case podNetworkTypeVPCIP:
+        allocIPReply.IPType = rpc.IPType_TypeVPCIP
+        var vpcVeth *types.Veth
+        vpcVeth, err = n.allocateVeth(networkContext, &oldRes)
+        if err != nil {
+            return nil, fmt.Errorf("error get allocated vpc ip for: %+v, result: %+v", podinfo, err)
+        }
+        newRes := types.PodResources{
+            PodInfo:   podinfo,
+            Resources: vpcVeth.ToResItems(),
+            NetNs: func(s string) *string {
+                return &s
+            }(r.Netns),
+        }
+        networkContext.resources = append(networkContext.resources, newRes.Resources...)
+        err = n.resourceDB.Put(podInfoKey(podinfo.Namespace, podinfo.Name), newRes)
+        if err != nil {
+            return nil, errors.Wrapf(err, "error put resource into store")
+        }
+        netConf = append(netConf, &rpc.NetConf{
+            BasicInfo: &rpc.BasicInfo{
+                PodIP:       nil,
+                PodCIDR:     n.k8s.GetNodeCidr().ToRPC(),
+                GatewayIP:   nil,
+                ServiceCIDR: n.k8s.GetServiceCIDR().ToRPC(),
+            },
+            ENIInfo: nil,
+            Pod: &rpc.Pod{
+                Ingress: podinfo.TcIngress,
+                Egress:  podinfo.TcEgress,
+            },
+            IfName:       "",
+            ExtraRoutes:  nil,
+            DefaultRoute: true,
+        })
+        allocIPReply.Success = true
+    default:
+        return nil, fmt.Errorf("not support pod network type")
+    }
 
-	var resourceRequests []eni.ResourceRequest
+    // 4. grpc connection
+    if ctx.Err() != nil {
+        err = ctx.Err()
+        return nil, fmt.Errorf("error on grpc connection, %w", err)
+    }
 
-	var netConf []*rpc.NetConf
-	// 3. Allocate network resource for pod
-	switch pod.PodNetworkType {
-	case daemon.PodNetworkTypeENIMultiIP:
-		reply.IPType = rpc.IPType_TypeENIMultiIP
+    allocIPReply.NetConfs = netConf
+    allocIPReply.EnableTrunking = n.enableTrunk
 
-		if pod.PodENI {
-			resourceRequests = append(resourceRequests, &eni.RemoteIPRequest{})
-		} else {
-			req := &eni.LocalIPRequest{}
-			if pod.ERdma {
-				req.LocalIPType = eni.LocalIPTypeERDMA
-			}
-			if len(oldRes.GetResourceItemByType(daemon.ResourceTypeENIIP)) == 1 {
-				old := oldRes.GetResourceItemByType(daemon.ResourceTypeENIIP)[0]
-
-				setRequest(req, old)
-			}
-
-			resourceRequests = append(resourceRequests, req)
-		}
-	case daemon.PodNetworkTypeVPCENI:
-		reply.IPType = rpc.IPType_TypeVPCENI
-
-		if pod.PodENI || n.ipamType == types.IPAMTypeCRD {
-			resourceRequests = append(resourceRequests, &eni.RemoteIPRequest{})
-		} else {
-			req := &eni.LocalIPRequest{}
-
-			if len(oldRes.GetResourceItemByType(daemon.ResourceTypeENI)) == 1 {
-				old := oldRes.GetResourceItemByType(daemon.ResourceTypeENI)[0]
-
-				setRequest(req, old)
-			}
-			resourceRequests = append(resourceRequests, req)
-		}
-	case daemon.PodNetworkTypeVPCIP:
-		reply.IPType = rpc.IPType_TypeVPCIP
-		resourceRequests = append(resourceRequests, &eni.VethRequest{})
-	default:
-		return nil, &types.Error{
-			Code: types.ErrInternalError,
-			Msg:  "Unknown pod network type",
-		}
-	}
-
-	var networkResource []daemon.ResourceItem
-
-	resp, err := n.eniMgr.Allocate(ctx, cni, &eni.AllocRequest{
-		ResourceRequests: resourceRequests,
-	})
-	if err != nil {
-		_ = n.eniMgr.Release(ctx, cni, &eni.ReleaseRequest{
-			NetworkResources: resp,
-		})
-		return nil, err
-	}
-
-	for _, res := range resp {
-		netConf = append(netConf, res.ToRPC()...)
-		networkResource = append(networkResource, res.ToStore()...)
-	}
-
-	for _, c := range netConf {
-		if c.BasicInfo == nil {
-			c.BasicInfo = &rpc.BasicInfo{}
-		}
-		c.BasicInfo.ServiceCIDR = n.k8s.GetServiceCIDR().ToRPC()
-		if pod.PodNetworkType == daemon.PodNetworkTypeVPCIP {
-			c.BasicInfo.PodCIDR = n.k8s.GetNodeCidr().ToRPC()
-		}
-		c.Pod = &rpc.Pod{
-			Ingress:         pod.TcIngress,
-			Egress:          pod.TcEgress,
-			NetworkPriority: pod.NetworkPriority,
-		}
-	}
-
-	err = defaultForNetConf(netConf)
-	if err != nil {
-		return nil, err
-	}
-
-	out, err := json.Marshal(netConf)
-	if err != nil {
-		return nil, &types.Error{
-			Code: types.ErrInternalError,
-			R:    err,
-		}
-	}
-
-	ips := getPodIPs(netConf)
-	if len(ips) > 0 {
-		_ = n.k8s.PatchPodIPInfo(pod, strings.Join(ips, ","))
-	}
-
-	// 4. Record resource info
-	newRes := daemon.PodResources{
-		PodInfo:     pod,
-		Resources:   networkResource,
-		NetNs:       &r.Netns,
-		ContainerID: &r.K8SPodInfraContainerId,
-		NetConf:     string(out),
-	}
-
-	err = n.resourceDB.Put(podID, newRes)
-	if err != nil {
-		return nil, err
-	}
-
-	reply.NetConfs = netConf
-	reply.Success = true
-
-	return reply, nil
+    // 5. return allocate result
+    return allocIPReply, err
 }
 
 func (n *networkService) ReleaseIP(ctx context.Context, r *rpc.ReleaseIPRequest) (*rpc.ReleaseIPReply, error) {
-	podID := utils.PodInfoKey(r.K8SPodNamespace, r.K8SPodName)
-	l := logf.FromContext(ctx)
-	l.Info("release ip req")
+    serviceLog.WithFields(map[string]interface{}{
+        "pod":         podInfoKey(r.K8SPodNamespace, r.K8SPodName),
+        "containerID": r.K8SPodInfraContainerId,
+    }).Info("release ip req")
 
-	_, exist := n.pendingPods.LoadOrStore(podID, struct{}{})
-	if exist {
-		return nil, &types.Error{
-			Code: types.ErrPodIsProcessing,
-			Msg:  fmt.Sprintf("Pod %s request is processing", podID),
-		}
-	}
-	defer func() {
-		n.pendingPods.Delete(podID)
-	}()
+    n.RLock()
+    defer n.RUnlock()
+    var (
+        start = time.Now()
+        err   error
+    )
+    defer func() {
+        metric.RPCLatency.WithLabelValues("ReleaseIP", fmt.Sprint(err != nil)).Observe(metric.MsSince(start))
+    }()
 
-	n.RLock()
-	defer n.RUnlock()
-	var (
-		start = time.Now()
-		err   error
-	)
+    // 0. Get pod Info
+    podinfo, err := n.k8s.GetPod(r.K8SPodNamespace, r.K8SPodName)
+    if err != nil {
+        return nil, errors.Wrapf(err, "error get pod info for: %+v", r)
+    }
 
-	reply := &rpc.ReleaseIPReply{
-		Success: true,
-		IPv4:    n.enableIPv4,
-		IPv6:    n.enableIPv6,
-	}
+    // 1. Init Context
+    netCtx := &networkContext{
+        Context:    ctx,
+        resources:  []types.ResourceItem{},
+        pod:        podinfo,
+        k8sService: n.k8s,
+    }
+    releaseReply := &rpc.ReleaseIPReply{
+        Success: true,
+        IPv4:    n.ipFamily.IPv4,
+        IPv6:    n.ipFamily.IPv6,
+    }
 
-	defer func() {
-		metric.RPCLatency.WithLabelValues("ReleaseIP", fmt.Sprint(err != nil)).Observe(metric.MsSince(start))
-		l.Info("release ip", "reply", fmt.Sprintf("%v", reply), "err", fmt.Sprintf("%v", err))
-	}()
+    defer func() {
+        if err != nil {
+            netCtx.Log().Errorf("release result with error, %+v", err)
+        } else {
+            netCtx.Log().Infof("release result: %+v", releaseReply)
+        }
+    }()
 
-	// 0. Get pod Info
-	pod, err := n.k8s.GetPod(ctx, r.K8SPodNamespace, r.K8SPodName, true)
-	if err != nil {
-		if k8sErr.IsNotFound(err) {
-			return reply, nil
-		}
-		return nil, err
-	}
+    oldRes, err := n.getPodResource(podinfo)
+    if err != nil {
+        return nil, err
+    }
 
-	cni := &daemon.CNI{
-		PodName:      r.K8SPodName,
-		PodNamespace: r.K8SPodNamespace,
-		PodID:        podID,
-		PodUID:       pod.PodUID,
-	}
+    if !n.verifyPodNetworkType(podinfo.PodNetworkType) {
+        netCtx.Log().Warnf("unexpect pod network type release, maybe daemon mode changed: %+v", podinfo.PodNetworkType)
+        return releaseReply, nil
+    }
 
-	// 1. Init Context
+    for _, res := range oldRes.Resources {
+        //record old resource for pod
+        netCtx.resources = append(netCtx.resources, res)
+        mgr := n.getResourceManagerForRes(res.Type)
+        if mgr == nil {
+            netCtx.Log().Warnf("error cleanup allocated network resource %s, %s: %v", res.ID, res.Type, err)
+            continue
+        }
+        if podinfo.IPStickTime == 0 {
+            if err = mgr.Release(netCtx, res); err != nil && err != pool.ErrInvalidState {
+                return nil, errors.Wrapf(err, "error release request network resource for: %+v", r)
+            }
+            if err = n.deletePodResource(podinfo); err != nil {
+                return nil, errors.Wrapf(err, "error delete resource from db: %+v", r)
+            }
+        }
+    }
 
-	oldRes, err := n.getPodResource(pod)
-	if err != nil {
-		return nil, err
-	}
+    if netCtx.Err() != nil {
+        err = ctx.Err()
+        return nil, fmt.Errorf("error on grpc connection, %w", err)
+    }
 
-	if !n.verifyPodNetworkType(pod.PodNetworkType) {
-		return nil, fmt.Errorf("unexpect pod network type allocate, maybe daemon mode changed: %+v", pod.PodNetworkType)
-	}
-
-	if oldRes.ContainerID != nil {
-		if r.K8SPodInfraContainerId != *oldRes.ContainerID {
-			l.Info("cni request not match stored resource, ignored", "old", *oldRes.ContainerID)
-			return reply, nil
-		}
-	}
-	if pod.IPStickTime == 0 {
-		for _, resource := range oldRes.Resources {
-			res := parseNetworkResource(resource)
-			if res == nil {
-				continue
-			}
-
-			err = n.eniMgr.Release(ctx, cni, &eni.ReleaseRequest{
-				NetworkResources: []eni.NetworkResource{res},
-			})
-			if err != nil {
-				return nil, err
-			}
-		}
-		err = n.deletePodResource(pod)
-		if err != nil {
-			return nil, fmt.Errorf("error delete pod resource: %w", err)
-		}
-	}
-
-	return reply, nil
+    return releaseReply, nil
 }
 
 func (n *networkService) GetIPInfo(ctx context.Context, r *rpc.GetInfoRequest) (*rpc.GetInfoReply, error) {
-	podID := utils.PodInfoKey(r.K8SPodNamespace, r.K8SPodName)
-	log := logf.FromContext(ctx)
-	log.Info("get ip req")
+    serviceLog.Debugf("GetIPInfo request: %+v", r)
+    // 0. Get pod Info
+    podinfo, err := n.k8s.GetPod(r.K8SPodNamespace, r.K8SPodName)
+    if err != nil {
+        return nil, errors.Wrapf(err, "error get pod info for: %+v", r)
+    }
 
-	_, exist := n.pendingPods.LoadOrStore(podID, struct{}{})
-	if exist {
-		return nil, &types.Error{
-			Code: types.ErrPodIsProcessing,
-			Msg:  fmt.Sprintf("Pod %s request is processing", podID),
-		}
-	}
-	defer func() {
-		n.pendingPods.Delete(podID)
-	}()
+    if !n.verifyPodNetworkType(podinfo.PodNetworkType) {
+        return nil, fmt.Errorf("unexpect pod network type get info, maybe daemon mode changed: %+v", podinfo.PodNetworkType)
+    }
 
-	n.RLock()
-	defer n.RUnlock()
+    // 1. Init Context
+    networkContext := &networkContext{
+        Context:    ctx,
+        resources:  []types.ResourceItem{},
+        pod:        podinfo,
+        k8sService: n.k8s,
+    }
 
-	var err error
+    getIPInfoResult := &rpc.GetInfoReply{IPv4: n.ipFamily.IPv4, IPv6: n.ipFamily.IPv6}
 
-	// 0. Get pod Info
-	pod, err := n.k8s.GetPod(ctx, r.K8SPodNamespace, r.K8SPodName, true)
-	if err != nil {
-		return nil, &types.Error{
-			Code: types.ErrInvalidArgsErrCode,
-			Msg:  err.Error(),
-			R:    err,
-		}
-	}
+    defer func() {
+        networkContext.Log().Debugf("getIpInfo result: %+v", getIPInfoResult)
+    }()
 
-	// 1. Init Context
-	reply := &rpc.GetInfoReply{
-		Success: true,
-		IPv4:    n.enableIPv4,
-		IPv6:    n.enableIPv6,
-	}
+    n.RLock()
+    podRes, err := n.getPodResource(podinfo)
+    n.RUnlock()
+    if err != nil {
+        networkContext.Log().Errorf("failed to get pod info : %+v", err)
+        return getIPInfoResult, err
+    }
 
-	switch pod.PodNetworkType {
-	case daemon.PodNetworkTypeENIMultiIP:
-		reply.IPType = rpc.IPType_TypeENIMultiIP
-	case daemon.PodNetworkTypeVPCIP:
-		reply.IPType = rpc.IPType_TypeVPCIP
-	case daemon.PodNetworkTypeVPCENI:
-		reply.IPType = rpc.IPType_TypeVPCENI
+    var netConf []*rpc.NetConf
+    // 2. return network info for pod
+    switch podinfo.PodNetworkType {
+    case podNetworkTypeENIMultiIP:
+        getIPInfoResult.IPType = rpc.IPType_TypeENIMultiIP
+        netConfs, err2 := n.multiIPFromCRD(podinfo, false)
+        if err != nil {
+            if k8sErr.IsNotFound(err2) {
+                getIPInfoResult.Error = rpc.Error_ErrCRDNotFound
+            }
+            return getIPInfoResult, nil
+        }
+        netConf = append(netConf, netConfs...)
 
-	default:
-		return nil, &types.Error{
-			Code: types.ErrInternalError,
-			Msg:  "Unknown pod network type",
-		}
-	}
+        defaultIfSet := false
+        for _, cfg := range netConf {
+            if defaultIf(cfg.IfName) {
+                defaultIfSet = true
+            }
+        }
+        if !defaultIfSet {
+            resItems := podRes.GetResourceItemByType(types.ResourceTypeENIIP)
+            if len(resItems) > 0 {
+                // only have one
+                res, err := n.eniIPResMgr.Stat(networkContext, resItems[0].ID)
+                if err == nil {
+                    eniIP := res.(*types.ENIIP)
 
-	// 2. Find old resource info
-	oldRes, err := n.getPodResource(pod)
-	if err != nil {
-		return nil, &types.Error{
-			Code: types.ErrInternalError,
-			Msg:  err.Error(),
-			R:    err,
-		}
-	}
+                    netConf = append(netConf, &rpc.NetConf{
+                        BasicInfo: &rpc.BasicInfo{
+                            PodIP:       eniIP.IPSet.ToRPC(),
+                            PodCIDR:     eniIP.ENI.VSwitchCIDR.ToRPC(),
+                            GatewayIP:   eniIP.ENI.GatewayIP.ToRPC(),
+                            ServiceCIDR: n.k8s.GetServiceCIDR().ToRPC(),
+                        },
+                        ENIInfo: &rpc.ENIInfo{
+                            MAC:   eniIP.ENI.MAC,
+                            Trunk: false,
+                        },
+                        Pod: &rpc.Pod{
+                            Ingress: podinfo.TcIngress,
+                            Egress:  podinfo.TcEgress,
+                        },
+                        IfName:      "",
+                        ExtraRoutes: nil,
+                    })
 
-	if !n.verifyPodNetworkType(pod.PodNetworkType) {
-		return nil, &types.Error{
-			Code: types.ErrInvalidArgsErrCode,
-			Msg:  "Unexpected network type, maybe daemon mode changed",
-		}
-	}
-	if oldRes.ContainerID != nil {
-		if r.K8SPodInfraContainerId != *oldRes.ContainerID {
-			log.Info("cni request not match stored resource, ignored", "old", *oldRes.ContainerID)
-			return reply, nil
-		}
-	}
-	netConf := make([]*rpc.NetConf, 0)
+                } else {
+                    serviceLog.Debugf("failed to get res stat %s", resItems[0].ID)
+                }
+            }
+        }
+        err = defaultForNetConf(netConf)
+        if err != nil {
+            return getIPInfoResult, err
+        }
+    case podNetworkTypeVPCIP:
+        getIPInfoResult.IPType = rpc.IPType_TypeVPCIP
+        netConf = append(netConf, &rpc.NetConf{
+            BasicInfo: &rpc.BasicInfo{
+                PodIP:       nil,
+                PodCIDR:     n.k8s.GetNodeCidr().ToRPC(),
+                GatewayIP:   nil,
+                ServiceCIDR: n.k8s.GetServiceCIDR().ToRPC(),
+            },
+            Pod: &rpc.Pod{
+                Ingress: podinfo.TcIngress,
+                Egress:  podinfo.TcEgress,
+            },
+            DefaultRoute: true,
+        })
+    case podNetworkTypeVPCENI:
+        getIPInfoResult.IPType = rpc.IPType_TypeVPCENI
+        if n.ipamType == types.IPAMTypeCRD {
+            netConfs, err2 := n.exclusiveENIFromCRD(podinfo, false)
+            if err2 != nil {
+                if k8sErr.IsNotFound(err2) {
+                    getIPInfoResult.Error = rpc.Error_ErrCRDNotFound
+                }
+                return getIPInfoResult, nil
+            }
+            netConf = append(netConf, netConfs...)
+        } else {
+            resItems := podRes.GetResourceItemByType(types.ResourceTypeENI)
+            if len(resItems) > 0 {
+                // only have one
+                res, err := n.eniResMgr.Stat(networkContext, resItems[0].ID)
+                if err == nil {
+                    eni := res.(*types.ENI)
 
-	err = json.Unmarshal([]byte(oldRes.NetConf), &netConf)
-	if err != nil {
-		// ignore for not found
-	} else {
-		reply.NetConfs = netConf
-	}
+                    netConf = append(netConf, &rpc.NetConf{
+                        BasicInfo: &rpc.BasicInfo{
+                            PodIP:       eni.PrimaryIP.ToRPC(),
+                            PodCIDR:     eni.VSwitchCIDR.ToRPC(),
+                            GatewayIP:   eni.GatewayIP.ToRPC(),
+                            ServiceCIDR: n.k8s.GetServiceCIDR().ToRPC(),
+                        },
+                        ENIInfo: &rpc.ENIInfo{
+                            MAC:   eni.MAC,
+                            Trunk: podinfo.PodENI && n.enableTrunk && eni.Trunk,
+                        },
+                        Pod: &rpc.Pod{
+                            Ingress: podinfo.TcIngress,
+                            Egress:  podinfo.TcEgress,
+                        },
+                        IfName:       "",
+                        ExtraRoutes:  nil,
+                        DefaultRoute: true,
+                    })
+                } else {
+                    serviceLog.Debugf("failed to get res stat %s", resItems[0].ID)
+                }
+            }
+        }
+    default:
+        return getIPInfoResult, errors.Errorf("unknown or unsupport network type for: %v", r)
+    }
 
-	reply.Success = true
+    getIPInfoResult.NetConfs = netConf
+    getIPInfoResult.EnableTrunking = n.enableTrunk
 
-	return reply, nil
+    return getIPInfoResult, nil
 }
 
 func (n *networkService) RecordEvent(_ context.Context, r *rpc.EventRequest) (*rpc.EventReply, error) {
-	eventType := corev1.EventTypeNormal
-	if r.EventType == rpc.EventType_EventTypeWarning {
-		eventType = corev1.EventTypeWarning
-	}
+    eventType := eventTypeNormal
+    if r.EventType == rpc.EventType_EventTypeWarning {
+        eventType = eventTypeWarning
+    }
 
-	reply := &rpc.EventReply{
-		Succeed: true,
-		Error:   "",
-	}
+    reply := &rpc.EventReply{
+        Succeed: true,
+        Error:   "",
+    }
 
-	if r.EventTarget == rpc.EventTarget_EventTargetNode { // Node
-		n.k8s.RecordNodeEvent(eventType, r.Reason, r.Message)
-		return reply, nil
-	}
+    if r.EventTarget == rpc.EventTarget_EventTargetNode { // Node
+        n.k8s.RecordNodeEvent(eventType, r.Reason, r.Message)
+        return reply, nil
+    }
 
-	// Pod
-	err := n.k8s.RecordPodEvent(r.K8SPodName, r.K8SPodNamespace, eventType, r.Reason, r.Message)
-	if err != nil {
-		reply.Succeed = false
-		reply.Error = err.Error()
+    // Pod
+    err := n.k8s.RecordPodEvent(r.K8SPodName, r.K8SPodNamespace, eventType, r.Reason, r.Message)
+    if err != nil {
+        reply.Succeed = false
+        reply.Error = err.Error()
 
-		return reply, err
-	}
+        return reply, err
+    }
 
-	return reply, nil
+    return reply, nil
 }
 
 func (n *networkService) verifyPodNetworkType(podNetworkMode string) bool {
-	return (n.daemonMode == daemon.ModeVPC && //vpc
-		(podNetworkMode == daemon.PodNetworkTypeVPCENI || podNetworkMode == daemon.PodNetworkTypeVPCIP)) ||
-		// eni-multi-ip
-		(n.daemonMode == daemon.ModeENIMultiIP && podNetworkMode == daemon.PodNetworkTypeENIMultiIP) ||
-		// eni-only
-		(n.daemonMode == daemon.ModeENIOnly && podNetworkMode == daemon.PodNetworkTypeVPCENI)
+    return (n.daemonMode == daemonModeVPC && //vpc
+        (podNetworkMode == podNetworkTypeVPCENI || podNetworkMode == podNetworkTypeVPCIP)) ||
+        // eni-multi-ip
+        (n.daemonMode == daemonModeENIMultiIP && podNetworkMode == podNetworkTypeENIMultiIP) ||
+        // eni-only
+        (n.daemonMode == daemonModeENIOnly && podNetworkMode == podNetworkTypeVPCENI)
 }
 
-func (n *networkService) startGarbageCollectionLoop(ctx context.Context) {
-	_ = wait.PollUntilContextCancel(ctx, gcPeriod, true, func(ctx context.Context) (done bool, err error) {
-		err = n.gcPods(ctx)
-		if err != nil {
-			serviceLog.Error(err, "error garbage collection")
-		}
-		return false, nil
-	})
+func (n *networkService) startGarbageCollectionLoop() {
+    // period do network resource gc
+    gcTicker := time.NewTicker(gcPeriod)
+    go func() {
+        for range gcTicker.C {
+            serviceLog.Debugf("do resource gc on node")
+            n.Lock()
+            pods, err := n.k8s.GetLocalPods()
+            if err != nil {
+                serviceLog.Warnf("error get local pods for gc")
+                n.Unlock()
+                continue
+            }
+            podKeyMap := make(map[string]bool)
+
+            for _, pod := range pods {
+                if !pod.SandboxExited {
+                    podKeyMap[podInfoKey(pod.Namespace, pod.Name)] = true
+                }
+            }
+
+            var (
+                inUseSet         = make(map[string]map[string]types.ResourceItem)
+                expireSet        = make(map[string]map[string]types.ResourceItem)
+                relateExpireList = make([]string, 0)
+            )
+
+            resRelateList, err := n.resourceDB.List()
+            if err != nil {
+                serviceLog.Warnf("error list resource db for gc")
+                n.Unlock()
+                continue
+            }
+
+            for _, resRelateObj := range resRelateList {
+                resRelate := resRelateObj.(types.PodResources)
+                _, podExist := podKeyMap[podInfoKey(resRelate.PodInfo.Namespace, resRelate.PodInfo.Name)]
+                if !podExist {
+                    if resRelate.PodInfo.IPStickTime != 0 {
+                        // delay resource garbage collection for sticky ip
+                        resRelate.PodInfo.IPStickTime = 0
+                        if err = n.resourceDB.Put(podInfoKey(resRelate.PodInfo.Namespace, resRelate.PodInfo.Name),
+                            resRelate); err != nil {
+                            serviceLog.Warnf("error store pod info to resource db")
+                        }
+                        podExist = true
+                    } else {
+                        relateExpireList = append(relateExpireList, podInfoKey(resRelate.PodInfo.Namespace, resRelate.PodInfo.Name))
+                    }
+                }
+                for _, res := range resRelate.Resources {
+                    if _, ok := inUseSet[res.Type]; !ok {
+                        inUseSet[res.Type] = make(map[string]types.ResourceItem)
+                        expireSet[res.Type] = make(map[string]types.ResourceItem)
+                    }
+                    // already in use by others
+                    if _, ok := inUseSet[res.Type][res.ID]; ok {
+                        continue
+                    }
+                    if podExist {
+                        // remove resource from expirelist
+                        delete(expireSet[res.Type], res.ID)
+                        inUseSet[res.Type][res.ID] = res
+                    } else {
+                        if _, ok := inUseSet[res.Type][res.ID]; !ok {
+                            expireSet[res.Type][res.ID] = res
+                        }
+                    }
+                }
+            }
+            gcDone := true
+            for mgrType := range inUseSet {
+                mgr, ok := n.mgrForResource[mgrType]
+                if ok {
+                    serviceLog.Debugf("start garbage collection for %v, list: %+v， %+v", mgrType, inUseSet[mgrType], expireSet[mgrType])
+                    err = mgr.GarbageCollection(inUseSet[mgrType], expireSet[mgrType])
+                    if err != nil {
+                        serviceLog.Warnf("error do garbage collection for %+v, inuse: %v, expire: %v, err: %v", mgrType, inUseSet[mgrType], expireSet[mgrType], err)
+                        gcDone = false
+                    }
+                }
+            }
+            if gcDone {
+                func() {
+                    resMap, ok := expireSet[types.ResourceTypeENIIP]
+                    if !ok {
+                        return
+                    }
+                    for resID := range resMap {
+                        // try clean ip rules
+                        list := strings.SplitAfterN(resID, ".", 2)
+                        if len(list) <= 1 {
+                            serviceLog.Debugf("skip gc res id %s", resID)
+                            continue
+                        }
+                        serviceLog.Debugf("checking ip %s", list[1])
+                        _, addr, err := net.ParseCIDR(fmt.Sprintf("%s/32", list[1]))
+                        if err != nil {
+                            serviceLog.Errorf("failed parse ip %s", list[1])
+                            return
+                        }
+                        // try clean all
+                        err = link.DeleteIPRulesByIP(addr)
+                        if err != nil {
+                            serviceLog.Errorf("failed release ip rules %v", err)
+                        }
+                        err = link.DeleteRouteByIP(addr)
+                        if err != nil {
+                            serviceLog.Errorf("failed delete route %v", err)
+                        }
+                    }
+                }()
+
+                for _, relate := range relateExpireList {
+                    err = n.resourceDB.Delete(relate)
+                    if err != nil {
+                        serviceLog.Warnf("error delete resource db relation: %v", err)
+                    }
+                }
+            }
+            n.Unlock()
+        }
+    }()
 }
 
-func (n *networkService) gcPods(ctx context.Context) error {
-	n.Lock()
-	defer n.Unlock()
-
-	pods, err := n.k8s.GetLocalPods()
-	if err != nil {
-		return err
-	}
-	exist := make(map[string]bool)
-
-	existIPs := sets.Set[string]{}
-
-	for _, pod := range pods {
-		if !pod.SandboxExited {
-			exist[utils.PodInfoKey(pod.Namespace, pod.Name)] = true
-			if pod.PodIPs.IPv4 != nil {
-				existIPs.Insert(pod.PodIPs.IPv4.String())
-			}
-		}
-	}
-
-	objList, err := n.resourceDB.List()
-	if err != nil {
-		return err
-	}
-	podResources := getPodResources(objList)
-
-	for _, podRes := range podResources {
-		if podRes.PodInfo != nil {
-			if podRes.PodInfo.PodIPs.IPv4 != nil {
-				existIPs.Insert(podRes.PodInfo.PodIPs.IPv4.String())
-			}
-		}
-
-		podID := utils.PodInfoKey(podRes.PodInfo.Namespace, podRes.PodInfo.Name)
-		if _, ok := exist[podID]; ok {
-			continue
-		}
-		// check kube-api again
-		ok, err := n.k8s.PodExist(podRes.PodInfo.Namespace, podRes.PodInfo.Name)
-		if err != nil || ok {
-			continue
-		}
-
-		// that is old logic ... keep it
-		if podRes.PodInfo.IPStickTime != 0 {
-			podRes.PodInfo.IPStickTime = 0
-
-			err = n.resourceDB.Put(podID, podRes)
-			if err != nil {
-				return err
-			}
-			continue
-		}
-
-		for _, resource := range podRes.Resources {
-			res := parseNetworkResource(resource)
-			if res == nil {
-				continue
-			}
-			err = n.eniMgr.Release(ctx, &daemon.CNI{
-				PodName:      podRes.PodInfo.Name,
-				PodNamespace: podRes.PodInfo.Namespace,
-				PodID:        podID,
-				PodUID:       podRes.PodInfo.PodUID,
-			}, &eni.ReleaseRequest{
-				NetworkResources: []eni.NetworkResource{res},
-			})
-			if err != nil {
-				return err
-			}
-		}
-
-		err = n.deletePodResource(podRes.PodInfo)
-		if err != nil {
-			return err
-		}
-		serviceLog.Info("removed pod", "pod", podID)
-	}
-
-	if os.Getenv("TERWAY_GC_RULES") == "true" {
-		n.gcRulesOnce.Do(func() {
-			gcLeakedRules(existIPs)
-		})
-	}
-
-	return nil
+func (n *networkService) startPeriodCheck() {
+    // check pool
+    func() {
+        serviceLog.Debugf("compare poll with metadata")
+        podMapping, err := n.GetResourceMapping()
+        if err != nil {
+            serviceLog.Error(err)
+            return
+        }
+        for _, res := range podMapping {
+            if res.Valid {
+                continue
+            }
+            if res.Name == "" || res.Namespace == "" {
+                // just log
+                serviceLog.Warnf("found resource invalid %s %s", res.LocalResID, res.RemoteResID)
+            } else {
+                _ = tracing.RecordPodEvent(res.Name, res.Namespace, corev1.EventTypeWarning, "ResourceInvalid", fmt.Sprintf("resource %s", res.LocalResID))
+            }
+        }
+    }()
+    // call CNI CHECK, make sure all dev is ok
+    func() {
+        serviceLog.Debugf("call CNI CHECK")
+        defer func() {
+            serviceLog.Debugf("call CNI CHECK end")
+        }()
+        n.RLock()
+        podResList, err := n.resourceDB.List()
+        n.RUnlock()
+        if err != nil {
+            serviceLog.Error(err)
+            return
+        }
+        ff, err := ioutil.ReadFile(utils.NormalizePath(terwayCNIConf))
+        if err != nil {
+            serviceLog.Error(err)
+            return
+        }
+        for _, v := range podResList {
+            res := v.(types.PodResources)
+            if res.NetNs == nil {
+                continue
+            }
+            serviceLog.Debugf("checking pod name %s", res.PodInfo.Name)
+            cniCfg := libcni.NewCNIConfig([]string{n.cniBinPath}, nil)
+            netNs := filepath.Join("/proc/1/root/", *res.NetNs)
+            if utils.IsWindowsOS() {
+                netNs = *res.NetNs
+            }
+            func() {
+                ctx, cancel := context.WithTimeout(context.Background(), cniExecTimeout)
+                defer cancel()
+                err := cniCfg.CheckNetwork(ctx, &libcni.NetworkConfig{
+                    Network: &containertypes.NetConf{
+                        CNIVersion: "0.4.0",
+                        Name:       "terway",
+                        Type:       "terway",
+                    },
+                    Bytes: ff,
+                }, &libcni.RuntimeConf{
+                    ContainerID: "fake", // must provide
+                    NetNS:       netNs,
+                    IfName:      "eth0",
+                    Args: [][2]string{
+                        {"K8S_POD_NAME", res.PodInfo.Name},
+                        {"K8S_POD_NAMESPACE", res.PodInfo.Namespace},
+                    },
+                })
+                if err != nil {
+                    serviceLog.Error(err)
+                    return
+                }
+            }()
+        }
+    }()
 }
 
-func gcLeakedRules(existIP sets.Set[string]) {
-	links, err := netlink.LinkList()
-	if err != nil {
-		serviceLog.Error(err, "error list links")
-		return
-	}
+// requestCRD get crd from api
+// note: need tolerate crd is not exist, so contained can del pod normally
+func (n *networkService) requestCRD(podInfo *types.PodInfo, waitReady bool) (*podENITypes.PodENI, error) {
+    if n.ipamType == types.IPAMTypeCRD || podInfo.PodENI && n.enableTrunk {
+        var podENI *podENITypes.PodENI
+        var err error
+        if waitReady {
+            podENI, err = n.k8s.WaitPodENIInfo(podInfo)
+        } else {
+            podENI, err = n.k8s.GetPodENIInfo(podInfo)
+        }
+        if err != nil {
+            return nil, err
+        }
+        if len(podENI.Spec.Allocations) <= 0 {
+            return nil, fmt.Errorf("podENI has no allocation info")
+        }
 
-	ipvlLinks := lo.Filter(links, func(item netlink.Link, index int) bool {
-		_, ok := item.(*netlink.IPVlan)
-		return ok
-	})
-
-	gcRoutes(ipvlLinks, existIP)
-
-	normalLinks := lo.Filter(links, func(item netlink.Link, index int) bool {
-		_, ok := item.(*netlink.Device)
-		return ok
-	})
-
-	gcTCFilters(normalLinks, existIP)
+        return podENI, nil
+    }
+    return nil, nil
 }
 
-func (n *networkService) migrateEIP(ctx context.Context, objs []interface{}) error {
-	once := sync.Once{}
+func (n *networkService) multiIPFromCRD(podInfo *types.PodInfo, waitReady bool) ([]*rpc.NetConf, error) {
+    var netConf []*rpc.NetConf
 
-	for _, resObj := range objs {
-		podRes, ok := resObj.(daemon.PodResources)
-		if !ok {
-			continue
-		}
-		if podRes.PodInfo == nil || !podRes.PodInfo.EipInfo.PodEip {
-			continue
-		}
-		for _, eipRes := range podRes.Resources {
-			if eipRes.Type != daemon.ResourceTypeEIP {
-				continue
-			}
-			allocType := v1beta1.IPAllocTypeAuto
-			if podRes.PodInfo.EipInfo.PodEipID != "" {
-				allocType = v1beta1.IPAllocTypeStatic
-			}
-			releaseStrategy := v1beta1.ReleaseStrategyFollow
-			releaseAfter := ""
+    var nodeTrunkENI *types.ENI
+    podEni, err := n.requestCRD(podInfo, waitReady)
+    if err != nil {
+        return nil, fmt.Errorf("error wait pod eni info, %w", err)
+    }
+    if podEni == nil {
+        return nil, nil
+    }
+    nodeTrunkENI = n.eniIPResMgr.(*eniIPResourceManager).trunkENI
+    if nodeTrunkENI == nil || nodeTrunkENI.ID != podEni.Status.TrunkENIID {
+        return nil, fmt.Errorf("pod status eni parent not match instance trunk eni")
+    }
+    // for now only ipvlan is supported
 
-			if podRes.PodInfo.IPStickTime > 0 {
-				releaseStrategy = v1beta1.ReleaseStrategyTTL
-				releaseAfter = podRes.PodInfo.IPStickTime.String()
-			}
+    // call api to get eni info
+    for _, alloc := range podEni.Spec.Allocations {
+        podIP := &rpc.IPSet{}
+        cidr := &rpc.IPSet{}
+        gw := &rpc.IPSet{}
+        if alloc.IPv4 != "" {
+            podIP.IPv4 = alloc.IPv4
+            cidr.IPv4 = alloc.IPv4CIDR
+            gw.IPv4 = terwayIP.DeriveGatewayIP(alloc.IPv4CIDR)
 
-			var err error
-			once.Do(func() {
-				err = crds.CreateOrUpdateCRD(ctx, n.k8s.GetClient(), crds.CRDPodEIP)
-			})
-			if err != nil {
-				return err
-			}
+            if cidr.IPv4 == "" || gw.IPv4 == "" {
+                return nil, fmt.Errorf("empty cidr or gateway")
+            }
+        }
+        if alloc.IPv6 != "" {
+            podIP.IPv6 = alloc.IPv6
+            cidr.IPv6 = alloc.IPv6CIDR
+            gw.IPv6 = terwayIP.DeriveGatewayIP(alloc.IPv6CIDR)
 
-			ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+            if cidr.IPv6 == "" || gw.IPv6 == "" {
+                return nil, fmt.Errorf("empty cidr or gateway")
+            }
+        }
+        eniInfo := &rpc.ENIInfo{
+            MAC:   alloc.ENI.MAC,
+            Trunk: true,
+        }
+        eniInfo.MAC = nodeTrunkENI.MAC // set trunk eni mac
 
-			//l := serviceLog.WithField("name", fmt.Sprintf("%s/%s", podRes.PodInfo.Namespace, podRes.PodInfo.Name))
+        info, ok := podEni.Status.ENIInfos[alloc.ENI.ID]
+        if !ok {
+            return nil, fmt.Errorf("error get podENI status")
+        }
+        vid := uint32(info.Vid)
+        eniInfo.Vid = vid
 
-			c := n.k8s.GetClient()
-			podEIP := &v1beta1.PodEIP{}
-			err = c.Get(ctx, k8stypes.NamespacedName{Namespace: podRes.PodInfo.Namespace, Name: podRes.PodInfo.Name}, podEIP)
-			if err == nil {
-				cancel()
-				//l.Info("skip create podEIP, already exist")
-				continue
-			}
-			if !k8sErr.IsNotFound(err) {
-				cancel()
-				return err
-			}
+        netConf = append(netConf, &rpc.NetConf{
+            BasicInfo: &rpc.BasicInfo{
+                PodIP:       podIP,
+                PodCIDR:     cidr,
+                GatewayIP:   gw,
+                ServiceCIDR: n.k8s.GetServiceCIDR().ToRPC(),
+            },
+            ENIInfo: eniInfo,
+            Pod: &rpc.Pod{
+                Ingress: podInfo.TcIngress,
+                Egress:  podInfo.TcEgress,
+            },
+            IfName:       alloc.Interface,
+            ExtraRoutes:  parseExtraRoute(alloc.ExtraRoutes),
+            DefaultRoute: alloc.DefaultRoute,
+        })
+    }
 
-			err = retry.OnError(wait.Backoff{
-				Steps:    4,
-				Duration: 200 * time.Millisecond,
-				Factor:   5.0,
-				Jitter:   0.1,
-			}, func(err error) bool {
-				if k8sErr.IsTooManyRequests(err) {
-					return true
-				}
-				if k8sErr.IsInternalError(err) {
-					return true
-				}
-				return false
-			}, func() error {
-				podEIP = &v1beta1.PodEIP{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:        podRes.PodInfo.Name,
-						Namespace:   podRes.PodInfo.Namespace,
-						Annotations: map[string]string{},
-						Finalizers:  []string{"podeip-controller.alibabacloud.com/finalizer"},
-					},
-					Spec: v1beta1.PodEIPSpec{
-						AllocationID:       eipRes.ID,
-						BandwidthPackageID: podRes.PodInfo.EipInfo.PodEipBandwidthPackageID,
-						AllocationType: v1beta1.AllocationType{
-							Type:            allocType,
-							ReleaseStrategy: releaseStrategy,
-							ReleaseAfter:    releaseAfter,
-						},
-					},
-				}
+    return netConf, nil
+}
 
-				//l.Infof("create podEIP for %v", podRes)
+func (n *networkService) exclusiveENIFromCRD(podInfo *types.PodInfo, waitReady bool) ([]*rpc.NetConf, error) {
+    var netConf []*rpc.NetConf
 
-				err := c.Create(ctx, podEIP)
-				if k8sErr.IsAlreadyExists(err) {
-					return nil
-				}
-				return err
-			})
-			cancel()
+    var nodeTrunkENI *types.ENI
+    podEni, err := n.requestCRD(podInfo, waitReady)
+    if err != nil {
+        return nil, fmt.Errorf("error wait pod eni info, %w", err)
+    }
 
-			if err != nil {
-				return err
-			}
-		}
-	}
-	return nil
+    if n.enableTrunk {
+        nodeTrunkENI = n.eniResMgr.(*eniResourceManager).trunkENI
+        if nodeTrunkENI == nil || nodeTrunkENI.ID != podEni.Status.TrunkENIID {
+            return nil, fmt.Errorf("pod status eni parent not match instance trunk eni")
+        }
+    }
+
+    // call api to get eni info
+    for _, alloc := range podEni.Spec.Allocations {
+        podIP := &rpc.IPSet{}
+        cidr := &rpc.IPSet{}
+        gw := &rpc.IPSet{}
+        if alloc.IPv4 != "" {
+            podIP.IPv4 = alloc.IPv4
+            cidr.IPv4 = alloc.IPv4CIDR
+            gw.IPv4 = terwayIP.DeriveGatewayIP(alloc.IPv4CIDR)
+
+            if cidr.IPv4 == "" || gw.IPv4 == "" {
+                return nil, fmt.Errorf("empty cidr or gateway")
+            }
+        }
+        if alloc.IPv6 != "" {
+            podIP.IPv6 = alloc.IPv6
+            cidr.IPv6 = alloc.IPv6CIDR
+            gw.IPv6 = terwayIP.DeriveGatewayIP(alloc.IPv6CIDR)
+
+            if cidr.IPv6 == "" || gw.IPv6 == "" {
+                return nil, fmt.Errorf("empty cidr or gateway")
+            }
+        }
+        eniInfo := &rpc.ENIInfo{
+            MAC:   alloc.ENI.MAC,
+            Trunk: false,
+        }
+        if n.enableTrunk {
+            eniInfo.MAC = nodeTrunkENI.MAC // set trunk eni mac
+            eniInfo.Trunk = true
+            info, ok := podEni.Status.ENIInfos[alloc.ENI.ID]
+            if !ok {
+                return nil, fmt.Errorf("error get podENI status")
+            }
+            vid := uint32(info.Vid)
+            eniInfo.Vid = vid
+        }
+        netConf = append(netConf, &rpc.NetConf{
+            BasicInfo: &rpc.BasicInfo{
+                PodIP:       podIP,
+                PodCIDR:     cidr,
+                GatewayIP:   gw,
+                ServiceCIDR: n.k8s.GetServiceCIDR().ToRPC(),
+            },
+            ENIInfo: eniInfo,
+            Pod: &rpc.Pod{
+                Ingress: podInfo.TcIngress,
+                Egress:  podInfo.TcEgress,
+            },
+            IfName:       alloc.Interface,
+            ExtraRoutes:  parseExtraRoute(alloc.ExtraRoutes),
+            DefaultRoute: alloc.DefaultRoute,
+        })
+    }
+    err = defaultForNetConf(netConf)
+    if err != nil {
+        return nil, err
+    }
+    return netConf, nil
 }
 
 // tracing
 func (n *networkService) Config() []tracing.MapKeyValueEntry {
-	// name, daemon_mode, configFilePath, kubeconfig, master
-	config := []tracing.MapKeyValueEntry{
-		{Key: tracingKeyName, Value: networkServiceName}, // use a unique name?
-		{Key: tracingKeyDaemonMode, Value: n.daemonMode},
-		{Key: tracingKeyConfigFilePath, Value: n.configFilePath},
-	}
+    // name, daemon_mode, configFilePath, kubeconfig, master
+    config := []tracing.MapKeyValueEntry{
+        {Key: tracingKeyName, Value: networkServiceName}, // use a unique name?
+        {Key: tracingKeyDaemonMode, Value: n.daemonMode},
+        {Key: tracingKeyConfigFilePath, Value: n.configFilePath},
+        {Key: tracingKeyKubeConfig, Value: n.kubeConfig},
+        {Key: tracingKeyMaster, Value: n.master},
+    }
 
-	return config
+    return config
 }
 
 func (n *networkService) Trace() []tracing.MapKeyValueEntry {
-	count := 0
-	n.pendingPods.Range(func(key, value interface{}) bool {
-		count++
-		return true
-	})
+    count := 0
+    n.pendingPods.Range(func(key, value interface{}) bool {
+        count++
+        return true
+    })
 
-	trace := []tracing.MapKeyValueEntry{
-		{Key: tracingKeyPendingPodsCount, Value: fmt.Sprint(count)},
-	}
-	resList, err := n.resourceDB.List()
-	if err != nil {
-		trace = append(trace, tracing.MapKeyValueEntry{Key: "error", Value: err.Error()})
-		return trace
-	}
+    trace := []tracing.MapKeyValueEntry{
+        {Key: tracingKeyPendingPodsCount, Value: fmt.Sprint(count)},
+    }
+    resList, err := n.resourceDB.List()
+    if err != nil {
+        trace = append(trace, tracing.MapKeyValueEntry{Key: "error", Value: err.Error()})
+        return trace
+    }
 
-	for _, v := range resList {
-		res := v.(daemon.PodResources)
+    for _, v := range resList {
+        res := v.(types.PodResources)
 
-		var resources []string
-		for _, v := range res.Resources {
-			resource := fmt.Sprintf("(%s)%s", v.Type, v.ID)
-			resources = append(resources, resource)
-		}
+        var resources []string
+        for _, v := range res.Resources {
+            resource := fmt.Sprintf("(%s)%s", v.Type, v.ID)
+            resources = append(resources, resource)
+        }
 
-		key := fmt.Sprintf("pods/%s/%s/resources", res.PodInfo.Namespace, res.PodInfo.Name)
-		trace = append(trace, tracing.MapKeyValueEntry{Key: key, Value: strings.Join(resources, " ")})
-	}
+        key := fmt.Sprintf("pods/%s/%s/resources", res.PodInfo.Namespace, res.PodInfo.Name)
+        trace = append(trace, tracing.MapKeyValueEntry{Key: key, Value: strings.Join(resources, " ")})
+    }
 
-	return trace
+    return trace
 }
 
 func (n *networkService) Execute(cmd string, _ []string, message chan<- string) {
-	switch cmd {
-	case commandMapping:
-		mapping, err := n.GetResourceMapping()
-		message <- fmt.Sprintf("mapping: %v, err: %s\n", mapping, err)
-	case commandResDB:
-		n.RLock()
-		defer n.RUnlock()
-		objList, err := n.resourceDB.List()
-		if err != nil {
-			message <- fmt.Sprintf("%s\n", err)
-		} else {
-			out, _ := json.Marshal(objList)
-			message <- string(out)
-		}
+    switch cmd {
+    case commandMapping:
+        mapping, err := n.GetResourceMapping()
+        message <- fmt.Sprintf("mapping: %v, err: %s\n", mapping, err)
+    default:
+        message <- "can't recognize command\n"
+    }
 
-	default:
-		message <- "can't recognize command\n"
-	}
-
-	close(message)
+    close(message)
 }
 
-func (n *networkService) GetResourceMapping() ([]*rpc.ResourceMapping, error) {
-	var mapping []*rpc.ResourceMapping
-	for _, status := range n.eniMgr.Status() {
-		mapping = append(mapping, toRPCMapping(status))
-	}
-	return mapping, nil
+func (n *networkService) GetResourceMapping() ([]*tracing.PodMapping, error) {
+    var poolStats tracing.ResourcePoolStats
+    var err error
+
+    n.RLock()
+    // get []ResourceMapping
+    switch n.daemonMode {
+    case daemonModeENIMultiIP:
+        poolStats, err = n.eniIPResMgr.GetResourceMapping()
+    case daemonModeVPC:
+        n.RUnlock()
+        return nil, nil
+    case daemonModeENIOnly:
+        poolStats, err = n.eniResMgr.GetResourceMapping()
+    }
+    if err != nil {
+        n.RUnlock()
+        return nil, err
+    }
+    // pod related res
+    pods, err := n.resourceDB.List()
+    n.RUnlock()
+    if err != nil {
+        return nil, err
+    }
+
+    return toResMapping(poolStats, pods)
 }
 
-func newNetworkService(ctx context.Context, configFilePath, daemonMode string) (*networkService, error) {
-	serviceLog.Info("start network service", "config", configFilePath, "daemonMode", daemonMode)
+// toResMapping toResMapping
+func toResMapping(poolStats tracing.ResourcePoolStats, pods []interface{}) ([]*tracing.PodMapping, error) {
+    // three way compare, use resource id as key
 
-	netSrv := &networkService{
-		configFilePath: configFilePath,
-		pendingPods:    sync.Map{},
-	}
-	if daemonMode == daemon.ModeENIMultiIP || daemonMode == daemon.ModeVPC || daemonMode == daemon.ModeENIOnly {
-		netSrv.daemonMode = daemonMode
-	} else {
-		return nil, fmt.Errorf("unsupport daemon mode")
-	}
+    all := map[string]*tracing.PodMapping{}
 
-	var err error
+    for _, res := range poolStats.GetLocal() {
+        old, ok := all[res.GetID()]
+        if !ok {
+            all[res.GetID()] = &tracing.PodMapping{
+                LocalResID: res.GetID(),
+            }
+            continue
+        }
+        old.LocalResID = res.GetID()
+    }
 
-	globalConfig, err := daemon.GetConfigFromFileWithMerge(configFilePath, nil)
-	if err != nil {
-		return nil, err
-	}
+    for _, res := range poolStats.GetRemote() {
+        old, ok := all[res.GetID()]
+        if !ok {
+            all[res.GetID()] = &tracing.PodMapping{
+                RemoteResID: res.GetID(),
+            }
+            continue
+        }
+        old.RemoteResID = res.GetID()
+    }
 
-	netSrv.k8s, err = k8s.NewK8S(daemonMode, globalConfig)
-	if err != nil {
-		return nil, fmt.Errorf("error init k8s: %w", err)
-	}
+    for _, pod := range pods {
+        p := pod.(types.PodResources)
+        for _, res := range p.Resources {
+            if res.Type == types.ResourceTypeEIP {
+                continue
+            }
+            old, ok := all[res.ID]
+            if !ok {
+                all[res.ID] = &tracing.PodMapping{
+                    Name:         p.PodInfo.Name,
+                    Namespace:    p.PodInfo.Namespace,
+                    PodBindResID: res.ID,
+                }
+                continue
+            }
+            old.Name = p.PodInfo.Name
+            old.Namespace = p.PodInfo.Namespace
+            old.PodBindResID = res.ID
+            if old.PodBindResID == old.LocalResID && old.LocalResID == old.RemoteResID {
+                old.Valid = true
+            }
+        }
+    }
 
-	// load dynamic config
-	dynamicCfg, _, err := getDynamicConfig(ctx, netSrv.k8s)
-	if err != nil {
-		//serviceLog.Warnf("get dynamic config error: %s. fallback to default config", err.Error())
-		dynamicCfg = ""
-	}
+    mapping := make([]*tracing.PodMapping, 0, len(all))
+    for _, res := range all {
+        // idle
+        if res.Name == "" && res.LocalResID == res.RemoteResID {
+            res.Valid = true
+        }
+        mapping = append(mapping, res)
+    }
 
-	config, err := daemon.GetConfigFromFileWithMerge(configFilePath, []byte(dynamicCfg))
-	if err != nil {
-		return nil, fmt.Errorf("failed parse config: %v", err)
-	}
-
-	config.Populate()
-	err = config.Validate()
-	if err != nil {
-		return nil, err
-	}
-
-	serviceLog.Info("got config", "config", fmt.Sprintf("%+v", config))
-
-	backoff.OverrideBackoff(config.BackoffOverride)
-	_ = netSrv.k8s.SetCustomStatefulWorkloadKinds(config.CustomStatefulWorkloadKinds)
-	netSrv.ipamType = config.IPAMType
-
-	if os.Getenv("TERWAY_DEPLOY_ENV") == envEFLO {
-		instance.SetPopulateFunc(instance.EfloPopulate)
-		client.SetGetLimit(client.EfloGetLimit)
-	}
-
-	meta := instance.GetInstanceMeta()
-
-	var (
-		trunkENIID      = ""
-		nodeAnnotations = map[string]string{}
-	)
-
-	var providers []credential.Interface
-	if string(config.AccessID) != "" && string(config.AccessSecret) != "" {
-		providers = append(providers, credential.NewAKPairProvider(string(config.AccessID), string(config.AccessSecret)))
-	}
-	providers = append(providers, credential.NewEncryptedCredentialProvider(utils.NormalizePath(config.CredentialPath), "", ""))
-	providers = append(providers, credential.NewMetadataProvider())
-
-	clientSet, err := credential.NewClientMgr(meta.RegionID, providers...)
-	if err != nil {
-		return nil, err
-	}
-
-	aliyunClient, err := client.New(clientSet,
-		flowcontrol.NewTokenBucketRateLimiter(8, 10),
-		flowcontrol.NewTokenBucketRateLimiter(4, 5))
-	if err != nil {
-		return nil, err
-	}
-
-	instanceType := meta.InstanceType
-	if os.Getenv("TERWAY_DEPLOY_ENV") == envEFLO {
-		instanceType = meta.InstanceID
-	}
-	limit, err := client.GetLimit(aliyunClient, instanceType)
-	if err != nil {
-		return nil, fmt.Errorf("upable get instance limit, %w", err)
-	}
-
-	enableIPv4, enableIPv6 := checkInstance(limit, daemonMode, config)
-
-	netSrv.enableIPv4 = enableIPv4
-	netSrv.enableIPv6 = enableIPv6
-
-	eniConfig := getENIConfig(config)
-	eniConfig.EnableIPv4 = enableIPv4
-	eniConfig.EnableIPv6 = enableIPv6
-
-	// fall back to use primary eni's sg
-	if len(eniConfig.SecurityGroupIDs) == 0 {
-		enis, err := aliyunClient.DescribeNetworkInterface(ctx, "", nil, eniConfig.InstanceID, "Primary", "", nil)
-		if err != nil {
-			return nil, err
-		}
-		if len(enis) == 0 {
-			return nil, fmt.Errorf("no primary eni found")
-		}
-		eniConfig.SecurityGroupIDs = enis[0].SecurityGroupIDs
-	}
-
-	// get pool config
-	poolConfig, err := getPoolConfig(config, daemonMode, limit)
-	if err != nil {
-		return nil, err
-	}
-
-	poolConfig.EnableIPv4 = enableIPv4
-	poolConfig.EnableIPv6 = enableIPv6
-
-	serviceLog.Info("pool config", "pool", fmt.Sprintf("%+v", poolConfig))
-
-	vswPool, err := vswpool.NewSwitchPool(100, "10m")
-	if err != nil {
-		return nil, fmt.Errorf("error init vsw pool, %w", err)
-	}
-
-	var factory factory.Factory
-	if os.Getenv("TERWAY_DEPLOY_ENV") == envEFLO {
-		factory = aliyun.NewEflo(ctx, aliyunClient, vswPool, eniConfig)
-	} else {
-		factory = aliyun.NewAliyun(ctx, aliyunClient, eni2.NewENIMetadata(enableIPv4, enableIPv6), vswPool, eniConfig)
-	}
-
-	if config.EnableENITrunking {
-		trunkENIID, err = initTrunk(config, poolConfig, netSrv.k8s, factory)
-		if err != nil {
-			return nil, err
-		}
-		if trunkENIID == "" {
-			serviceLog.Info("no trunk eni found, fallback to non-trunk mode")
-		} else {
-			nodeAnnotations[types.TrunkOn] = trunkENIID
-			nodeAnnotations[string(types.MemberENIIPTypeIPs)] = strconv.Itoa(poolConfig.MaxMemberENI)
-		}
-	}
-
-	if daemonMode != daemon.ModeVPC {
-		nodeAnnotations[string(types.NormalIPTypeIPs)] = strconv.Itoa(poolConfig.Capacity)
-	}
-
-	attached, err := factory.GetAttachedNetworkInterface(trunkENIID)
-	if err != nil {
-		return nil, err
-	}
-
-	realRdmaCount := limit.ERDMARes()
-	if config.EnableERDMA && len(attached) >= limit.Adapters-1-limit.ERdmaAdapters {
-		attachedERdma := lo.Filter(attached, func(ni *daemon.ENI, idx int) bool { return ni.ERdma })
-		if len(attachedERdma) <= 0 {
-			// turn off only when no one use it
-			serviceLog.Info(fmt.Sprintf("node has no enough free eni slot to attach more erdma to achieve erdma res: %d", limit.ERDMARes()))
-			config.EnableERDMA = false
-		}
-		// reset the cap to the actual using
-		realRdmaCount = min(realRdmaCount, len(attachedERdma))
-	}
-
-	if config.EnableERDMA {
-		if daemonMode == daemon.ModeENIMultiIP {
-			nodeAnnotations[string(types.NormalIPTypeIPs)] = strconv.Itoa(poolConfig.Capacity - realRdmaCount*limit.IPv4PerAdapter)
-			nodeAnnotations[string(types.ERDMAIPTypeIPs)] = strconv.Itoa(realRdmaCount * limit.IPv4PerAdapter)
-			poolConfig.ERdmaCapacity = realRdmaCount * limit.IPv4PerAdapter
-		} else if daemonMode == daemon.ModeENIOnly {
-			nodeAnnotations[string(types.NormalIPTypeIPs)] = strconv.Itoa(poolConfig.Capacity - realRdmaCount)
-			nodeAnnotations[string(types.ERDMAIPTypeIPs)] = strconv.Itoa(realRdmaCount)
-			poolConfig.ERdmaCapacity = realRdmaCount
-		}
-	}
-
-	runDevicePlugin(daemonMode, config, poolConfig)
-
-	// ensure node annotations
-	err = netSrv.k8s.PatchNodeAnnotations(nodeAnnotations)
-	if err != nil {
-		return nil, fmt.Errorf("error patch node annotations, %w", err)
-	}
-
-	netSrv.resourceDB, err = storage.NewDiskStorage(
-		resDBName, utils.NormalizePath(resDBPath), json.Marshal, func(bytes []byte) (interface{}, error) {
-			resourceRel := &daemon.PodResources{}
-			err = json.Unmarshal(bytes, resourceRel)
-			if err != nil {
-				return nil, err
-			}
-			return *resourceRel, nil
-		})
-	if err != nil {
-		return nil, err
-	}
-
-	objList, err := netSrv.resourceDB.List()
-	if err != nil {
-		return nil, err
-	}
-
-	attachedENIID := lo.SliceToMap(attached, func(item *daemon.ENI) (string, *daemon.ENI) {
-		return item.ID, item
-	})
-	podResources := getPodResources(objList)
-	serviceLog.Info(fmt.Sprintf("loaded pod res, %v", podResources))
-
-	podResources = filterENINotFound(podResources, attachedENIID)
-
-	if config.EnableEIPMigrate {
-		err = netSrv.migrateEIP(ctx, objList)
-		if err != nil {
-			return nil, err
-		}
-		serviceLog.Info("eip migrate finished")
-	}
-
-	err = preStartResourceManager(daemonMode, netSrv.k8s)
-	if err != nil {
-		return nil, err
-	}
-
-	var eniList []eni.NetworkInterface
-
-	if daemonMode == daemon.ModeVPC {
-		eniList = append(eniList, &eni.Veth{})
-	}
-
-	if daemonMode == daemon.ModeENIOnly {
-		if config.IPAMType == types.IPAMTypeCRD {
-			if !config.EnableENITrunking {
-				eniList = append(eniList, eni.NewRemote(netSrv.k8s.GetClient(), nil))
-			} else {
-				for _, ni := range attached {
-					if !ni.Trunk {
-						continue
-					}
-					lo := eni.NewLocal(ni, "trunk", factory, poolConfig)
-					eniList = append(eniList, eni.NewTrunk(netSrv.k8s.GetClient(), lo))
-				}
-			}
-		} else {
-			var (
-				normalENICount int
-				erdmaENICount  int
-			)
-			// the legacy mode
-			for _, ni := range attached {
-				if config.EnableERDMA && ni.ERdma {
-					erdmaENICount++
-					eniList = append(eniList, eni.NewLocal(ni, "erdma", factory, poolConfig))
-				} else {
-					normalENICount++
-					eniList = append(eniList, eni.NewLocal(ni, "secondary", factory, poolConfig))
-				}
-			}
-			normalENINeeded := poolConfig.MaxENI - normalENICount
-			if config.EnableERDMA {
-				normalENINeeded = poolConfig.MaxENI - limit.ERdmaAdapters - normalENICount
-				for i := 0; i < limit.ERdmaAdapters-erdmaENICount; i++ {
-					eniList = append(eniList, eni.NewLocal(nil, "erdma", factory, poolConfig))
-				}
-			}
-
-			for i := 0; i < normalENINeeded; i++ {
-				eniList = append(eniList, eni.NewLocal(nil, "secondary", factory, poolConfig))
-			}
-		}
-	} else {
-		var (
-			normalENICount int
-			erdmaENICount  int
-		)
-		for _, ni := range attached {
-			serviceLog.V(5).Info("found attached eni", "eni", ni)
-			if config.EnableENITrunking && ni.Trunk && trunkENIID == ni.ID {
-				lo := eni.NewLocal(ni, "trunk", factory, poolConfig)
-				eniList = append(eniList, eni.NewTrunk(netSrv.k8s.GetClient(), lo))
-			} else if config.EnableERDMA && ni.ERdma {
-				erdmaENICount++
-				eniList = append(eniList, eni.NewLocal(ni, "erdma", factory, poolConfig))
-			} else {
-				normalENICount++
-				eniList = append(eniList, eni.NewLocal(ni, "secondary", factory, poolConfig))
-			}
-		}
-		normalENINeeded := poolConfig.MaxENI - normalENICount
-		if config.EnableERDMA {
-			normalENINeeded = poolConfig.MaxENI - limit.ERdmaAdapters - normalENICount
-			for i := 0; i < limit.ERdmaAdapters-erdmaENICount; i++ {
-				eniList = append(eniList, eni.NewLocal(nil, "erdma", factory, poolConfig))
-			}
-		}
-
-		for i := 0; i < normalENINeeded; i++ {
-			eniList = append(eniList, eni.NewLocal(nil, "secondary", factory, poolConfig))
-		}
-	}
-
-	eniManager := eni.NewManager(poolConfig.MinPoolSize, poolConfig.MaxPoolSize, poolConfig.Capacity, 30*time.Second, eniList, netSrv.k8s)
-	netSrv.eniMgr = eniManager
-	err = eniManager.Run(ctx, &netSrv.wg, podResources)
-	if err != nil {
-		return nil, err
-	}
-
-	if config.IPAMType != types.IPAMTypeCRD {
-		//start gc loop
-		go netSrv.startGarbageCollectionLoop(ctx)
-	}
-
-	// register for tracing
-	_ = tracing.Register(tracing.ResourceTypeNetworkService, "default", netSrv)
-	tracing.RegisterResourceMapping(netSrv)
-	tracing.RegisterEventRecorder(netSrv.k8s.RecordNodeEvent, netSrv.k8s.RecordPodEvent)
-
-	return netSrv, nil
+    sort.Slice(mapping, func(i, j int) bool {
+        if mapping[i].Name != mapping[j].Name {
+            return mapping[i].Name > mapping[j].Name
+        }
+        return mapping[i].RemoteResID < mapping[j].RemoteResID
+    })
+    return mapping, nil
 }
 
-func checkInstance(limit *client.Limits, daemonMode string, config *daemon.Config) (bool, bool) {
-	var enableIPv4, enableIPv6 bool
-	switch config.IPStack {
-	case "ipv4":
-		enableIPv4 = true
-	case "dual":
-		enableIPv4 = true
-		enableIPv6 = true
-	case "ipv6":
-		enableIPv6 = true
-	}
+func newNetworkService(configFilePath, kubeconfig, master, daemonMode string) (rpc.TerwayBackendServer, error) {
+    serviceLog.Debugf("start network service with: %s, %s", configFilePath, daemonMode)
+    cniBinPath := os.Getenv("CNI_PATH")
+    if cniBinPath == "" {
+        cniBinPath = cniDefaultPath
+    }
+    netSrv := &networkService{
+        configFilePath: configFilePath,
+        kubeConfig:     kubeconfig,
+        master:         master,
+        pendingPods:    sync.Map{},
+        cniBinPath:     utils.NormalizePath(cniBinPath),
+    }
+    if daemonMode == daemonModeENIMultiIP || daemonMode == daemonModeVPC || daemonMode == daemonModeENIOnly {
+        netSrv.daemonMode = daemonMode
+    } else {
+        return nil, fmt.Errorf("unsupport daemon mode")
+    }
 
-	if enableIPv6 {
-		if !limit.SupportIPv6() {
-			enableIPv6 = false
-			serviceLog.Info("instance is not support ipv6")
-		} else if daemonMode == daemon.ModeENIMultiIP && !limit.SupportMultiIPIPv6() {
-			enableIPv6 = false
-			serviceLog.Info("instance is not support multi ipv6")
-		}
-	}
+    var err error
 
-	if config.EnableENITrunking && limit.TrunkPod() <= 0 {
-		config.EnableENITrunking = false
-		serviceLog.Info("instance is not support trunk")
-	}
+    netSrv.k8s, err = newK8S(master, kubeconfig, daemonMode)
+    if err != nil {
+        return nil, errors.Wrapf(err, "error init k8s service")
+    }
 
-	if config.EnableERDMA {
-		if limit.ERDMARes() <= 0 {
-			config.EnableERDMA = false
-			serviceLog.Info("instance is not support erdma")
-		} else {
-			ok := nodecap.GetNodeCapabilities(nodecap.NodeCapabilityERDMA)
-			if ok == "" {
-				config.EnableERDMA = false
-				serviceLog.Info("os is not support erdma")
-			}
-		}
-	}
-	return enableIPv4, enableIPv6
+    // load dynamic config
+    dynamicCfg, nodeLabel, err := getDynamicConfig(netSrv.k8s)
+    if err != nil {
+        serviceLog.Warnf("get dynamic config error: %s. fallback to default config", err.Error())
+        dynamicCfg = ""
+    }
+
+    config, err := types.GetConfigFromFileWithMerge(configFilePath, []byte(dynamicCfg))
+    if err != nil {
+        return nil, fmt.Errorf("failed parse config: %v", err)
+    }
+
+    backoff.OverrideBackoff(config.BackoffOverride)
+
+    if len(dynamicCfg) == 0 {
+        serviceLog.Infof("got config: %+v from: %+v", config, configFilePath)
+    } else {
+        serviceLog.Infof("got config: %+v from %+v, with dynamic config %+v", config, configFilePath, nodeLabel)
+    }
+
+    if err := validateConfig(config); err != nil {
+        return nil, err
+    }
+
+    if err := setDefault(config); err != nil {
+        return nil, err
+    }
+
+    netSrv.ipamType = config.IPAMType
+    netSrv.eniCapPolicy = config.ENICapPolicy
+
+    ins := aliyun.GetInstanceMeta()
+    ipFamily := types.NewIPFamilyFromIPStack(types.IPStack(config.IPStack))
+    netSrv.ipFamily = ipFamily
+
+    aliyunClient, err := client.NewAliyun(config.AccessID, config.AccessSecret, ins.RegionID, utils.NormalizePath(config.CredentialPath), "", "")
+    if err != nil {
+        return nil, errors.Wrapf(err, "error create aliyun client")
+    }
+    err = aliyun.UpdateFromAPI(aliyunClient.ClientSet.ECS(), ins.InstanceType)
+    if err != nil {
+        return nil, err
+    }
+    limit, ok := aliyun.GetLimit(ins.InstanceType)
+    if !ok {
+        return nil, fmt.Errorf("upable get instance limit")
+    }
+    if !limit.SupportIPv6() {
+        ipFamily.IPv6 = false
+        serviceLog.Warnf("instance %s is not support ipv6", aliyun.GetInstanceMeta().InstanceType)
+    }
+    ecs := aliyun.NewAliyunImpl(aliyunClient, config.EnableENITrunking, ipFamily)
+
+    netSrv.enableTrunk = config.EnableENITrunking
+
+    ipNetSet := &types.IPNetSet{}
+    if config.ServiceCIDR != "" {
+        cidrs := strings.Split(config.ServiceCIDR, ",")
+
+        for _, cidr := range cidrs {
+            ipNetSet.SetIPNet(cidr)
+        }
+    }
+
+    err = netSrv.k8s.SetSvcCidr(ipNetSet)
+    if err != nil {
+        return nil, errors.Wrapf(err, "error set k8s svcCidr")
+    }
+
+    _ = netSrv.k8s.SetCustomStatefulWorkloadKinds(config.CustomStatefulWorkloadKinds)
+
+    netSrv.resourceDB, err = storage.NewDiskStorage(
+        resDBName, utils.NormalizePath(resDBPath), json.Marshal, func(bytes []byte) (interface{}, error) {
+            resourceRel := &types.PodResources{}
+            err = json.Unmarshal(bytes, resourceRel)
+            if err != nil {
+                return nil, errors.Wrapf(err, "error unmarshal pod relate resource")
+            }
+            return *resourceRel, nil
+        })
+    if err != nil {
+        return nil, errors.Wrapf(err, "error init resource manager storage")
+    }
+
+    // get pool config
+    poolConfig, err := getPoolConfig(config)
+    if err != nil {
+        return nil, errors.Wrapf(err, "error get pool config")
+    }
+    serviceLog.Infof("init pool config: %+v", poolConfig)
+
+    err = restoreLocalENIRes(ecs, netSrv.k8s, netSrv.resourceDB)
+    if err != nil {
+        return nil, errors.Wrapf(err, "error restore local eni resources")
+    }
+    localResource := make(map[string]map[string]resourceManagerInitItem)
+    resObjList, err := netSrv.resourceDB.List()
+    if err != nil {
+        return nil, errors.Wrapf(err, "error list resource relation db")
+    }
+    for _, resObj := range resObjList {
+        podRes := resObj.(types.PodResources)
+        for _, res := range podRes.Resources {
+            if localResource[res.Type] == nil {
+                localResource[res.Type] = make(map[string]resourceManagerInitItem)
+            }
+            localResource[res.Type][res.ID] = resourceManagerInitItem{item: res, podInfo: podRes.PodInfo}
+        }
+    }
+
+    resStr, err := json.Marshal(localResource)
+    if err != nil {
+        return nil, err
+    }
+    serviceLog.Debugf("local resources to restore: %s", resStr)
+
+    err = preStartResourceManager(daemonMode, netSrv.k8s)
+    if err != nil {
+        return nil, err
+    }
+
+    switch daemonMode {
+    case daemonModeVPC:
+        //init ENI
+        netSrv.eniResMgr, err = newENIResourceManager(poolConfig, ecs, localResource[types.ResourceTypeENI], ipFamily, netSrv.k8s)
+        if err != nil {
+            return nil, errors.Wrapf(err, "error init ENI resource manager")
+        }
+
+        netSrv.vethResMgr, err = newVPCResourceManager()
+        if err != nil {
+            return nil, errors.Wrapf(err, "error init vpc resource manager")
+        }
+
+        netSrv.mgrForResource = map[string]ResourceManager{
+            types.ResourceTypeENI:  netSrv.eniResMgr,
+            types.ResourceTypeVeth: netSrv.vethResMgr,
+        }
+
+    case daemonModeENIMultiIP:
+        //init ENI multi ip
+        netSrv.eniIPResMgr, err = newENIIPResourceManager(poolConfig, ecs, netSrv.k8s, localResource[types.ResourceTypeENIIP], ipFamily)
+        if err != nil {
+            return nil, errors.Wrapf(err, "error init ENI ip resource manager")
+        }
+        if config.EnableEIPPool == conditionTrue {
+            netSrv.eipResMgr = newEipResourceManager(ecs, netSrv.k8s, config.AllowEIPRob == conditionTrue)
+        }
+        netSrv.mgrForResource = map[string]ResourceManager{
+            types.ResourceTypeENIIP: netSrv.eniIPResMgr,
+            types.ResourceTypeEIP:   netSrv.eipResMgr,
+        }
+    case daemonModeENIOnly:
+        //init eni
+        netSrv.eniResMgr, err = newENIResourceManager(poolConfig, ecs, localResource[types.ResourceTypeENI], ipFamily, netSrv.k8s)
+        if err != nil {
+            return nil, errors.Wrapf(err, "error init eni resource manager")
+        }
+        if config.EnableEIPPool == conditionTrue && !config.EnableENITrunking {
+            netSrv.eipResMgr = newEipResourceManager(ecs, netSrv.k8s, config.AllowEIPRob == conditionTrue)
+        }
+        netSrv.mgrForResource = map[string]ResourceManager{
+            types.ResourceTypeENI: netSrv.eniResMgr,
+            types.ResourceTypeEIP: netSrv.eipResMgr,
+        }
+    default:
+        panic("unsupported daemon mode" + daemonMode)
+    }
+
+    //start gc loop
+    //netSrv.startGarbageCollectionLoop()
+    //period := poolCheckPeriod
+    //periodCfg := os.Getenv("POOL_CHECK_PERIOD_SECONDS")
+    //periodSeconds, err := strconv.Atoi(periodCfg)
+    //if err == nil {
+    //    period = time.Duration(periodSeconds) * time.Second
+    //}
+
+    //go wait.JitterUntil(netSrv.startPeriodCheck, period, 1, true, wait.NeverStop)
+
+    // register for tracing
+    _ = tracing.Register(tracing.ResourceTypeNetworkService, "default", netSrv)
+    tracing.RegisterResourceMapping(netSrv)
+    tracing.RegisterEventRecorder(netSrv.k8s.RecordNodeEvent, netSrv.k8s.RecordPodEvent)
+
+    return netSrv, nil
 }
 
-// initTrunk to ensure trunk eni is present. Return eni id if found.
-func initTrunk(config *daemon.Config, poolConfig *types.PoolConfig, k8sClient k8s.Kubernetes, f factory.Factory) (string, error) {
-	var err error
+// restore local eni resources for old terway migration
+func restoreLocalENIRes(ecs ipam.API, k8s Kubernetes, resourceDB storage.Storage) error {
+    resList, err := resourceDB.List()
+    if err != nil {
+        return errors.Wrapf(err, "error list resourceDB storage")
+    }
+    if len(resList) != 0 {
+        serviceLog.Debugf("skip restore for upgraded")
+        return nil
+    }
 
-	// get eni id form node annotation
-	preferTrunkID := k8sClient.GetTrunkID()
+    eniList, err := ecs.GetAttachedENIs(context.Background(), false)
+    if err != nil {
+        return errors.Wrapf(err, "error get attached eni for restore")
+    }
+    ipEniMap := map[string]*types.ENI{}
+    for _, eni := range eniList {
+        ipEniMap[eni.PrimaryIP.IPv4.String()] = eni
+    }
 
-	if config.WaitTrunkENI {
-		// at this mode , we retreat id ONLY by node annotation
-		if preferTrunkID == "" {
-			preferTrunkID, err = k8sClient.WaitTrunkReady()
-			if err != nil {
-				return "", fmt.Errorf("error wait trunk ready, %w", err)
-			}
-		}
-		return preferTrunkID, nil
-	}
-
-	// already exclude the primary eni
-	enis, err := f.GetAttachedNetworkInterface(preferTrunkID)
-	if err != nil {
-		return "", fmt.Errorf("error get attached eni, %w", err)
-	}
-
-	// get attached trunk eni
-	preferred := lo.Filter(enis, func(ni *daemon.ENI, idx int) bool { return ni.Trunk && ni.ID == preferTrunkID })
-	if len(preferred) > 0 {
-		// found the eni
-		trunk := preferred[0]
-		if trunk.ERdma {
-			serviceLog.Info("erdma eni on trunk mode, disable erdma")
-			config.EnableERDMA = false
-		}
-
-		return trunk.ID, nil
-	}
-
-	// choose one
-	attachedTrunk := lo.Filter(enis, func(ni *daemon.ENI, idx int) bool { return ni.Trunk })
-	if len(attachedTrunk) > 0 {
-		trunk := attachedTrunk[0]
-		if trunk.ERdma {
-			serviceLog.Info("erdma eni on trunk mode, disable erdma")
-			config.EnableERDMA = false
-		}
-
-		return trunk.ID, nil
-	}
-
-	// we have to create one if possible
-	if poolConfig.MaxENI <= len(enis) {
-		config.EnableENITrunking = false
-		return "", nil
-	}
-
-	v6 := 0
-	if poolConfig.EnableIPv6 {
-		v6 = 1
-	}
-	trunk, _, _, err := f.CreateNetworkInterface(1, v6, "trunk")
-	if err != nil {
-		if trunk != nil {
-			_ = f.DeleteNetworkInterface(trunk.ID)
-		}
-
-		return "", fmt.Errorf("error create trunk eni, %w", err)
-	}
-
-	return trunk.ID, nil
+    podList, err := k8s.GetLocalPods()
+    if err != nil {
+        return errors.Wrapf(err, "error get local pod for restore")
+    }
+    for _, pod := range podList {
+        if pod.PodNetworkType != podNetworkTypeVPCENI {
+            continue
+        }
+        serviceLog.Debugf("restore for local pod: %+v, enis: %+v", pod, ipEniMap)
+        eni, ok := ipEniMap[pod.PodIPs.IPv4.String()]
+        if ok {
+            err = resourceDB.Put(podInfoKey(pod.Namespace, pod.Name), types.PodResources{
+                PodInfo:   pod,
+                Resources: eni.ToResItems(),
+            })
+            if err != nil {
+                return errors.Wrapf(err, "error put resource into store")
+            }
+        } else {
+            serviceLog.Warnf("error found pod relate eni, pod: %+v", pod)
+        }
+    }
+    return nil
 }
 
-func runDevicePlugin(daemonMode string, config *daemon.Config, poolConfig *types.PoolConfig) {
-	switch daemonMode {
-	case daemon.ModeVPC, daemon.ModeENIOnly:
-		dp := deviceplugin.NewENIDevicePlugin(poolConfig.MaxENI, deviceplugin.ENITypeENI)
-		go dp.Serve()
-	case daemon.ModeENIMultiIP:
-		if config.EnableENITrunking {
-			dp := deviceplugin.NewENIDevicePlugin(poolConfig.MaxMemberENI, deviceplugin.ENITypeMember)
-			go dp.Serve()
-		}
-	}
+//setup default value
+func setDefault(cfg *types.Configure) error {
+    if cfg.EniCapRatio == 0 {
+        cfg.EniCapRatio = 1
+    }
 
-	if config.EnableERDMA {
-		if !config.DisableDevicePlugin {
-			res := deviceplugin.ENITypeERDMA
-			capacity := poolConfig.ERdmaCapacity
-			if capacity > 0 {
-				dp := deviceplugin.NewENIDevicePlugin(capacity, res)
-				go dp.Serve()
-			}
-		}
-	}
+    // Default policy for vswitch selection is random.
+    if cfg.VSwitchSelectionPolicy == "" {
+        cfg.VSwitchSelectionPolicy = types.VSwitchSelectionPolicyRandom
+    }
+
+    if cfg.IPStack == "" {
+        cfg.IPStack = string(types.IPStackIPv4)
+    }
+
+    return nil
 }
 
-func getPodResources(list []interface{}) []daemon.PodResources {
-	var res []daemon.PodResources
-	for _, resObj := range list {
-		res = append(res, resObj.(daemon.PodResources))
-	}
-	return res
+func validateConfig(cfg *types.Configure) error {
+    switch cfg.IPStack {
+    case "", string(types.IPStackIPv4), string(types.IPStackDual):
+    default:
+        return fmt.Errorf("unsupported ipStack %s in configMap", cfg.IPStack)
+    }
+
+    return nil
 }
 
-func parseNetworkResource(item daemon.ResourceItem) eni.NetworkResource {
-	switch item.Type {
-	case daemon.ResourceTypeENIIP, daemon.ResourceTypeENI:
-		var v4, v6 netip.Addr
-		if item.IPv4 != "" {
-			v4, _ = netip.ParseAddr(item.IPv4)
-		}
-		if item.IPv6 != "" {
-			v6, _ = netip.ParseAddr(item.IPv6)
-		}
+func getPoolConfig(cfg *types.Configure) (*types.PoolConfig, error) {
+    poolConfig := &types.PoolConfig{
+        MaxPoolSize:            cfg.MaxPoolSize,
+        MinPoolSize:            cfg.MinPoolSize,
+        MaxENI:                 cfg.MaxENI,
+        MinENI:                 cfg.MinENI,
+        AccessID:               cfg.AccessID,
+        AccessSecret:           cfg.AccessSecret,
+        EniCapRatio:            cfg.EniCapRatio,
+        EniCapShift:            cfg.EniCapShift,
+        SecurityGroups:         cfg.GetSecurityGroups(),
+        VSwitchSelectionPolicy: cfg.VSwitchSelectionPolicy,
+        EnableENITrunking:      cfg.EnableENITrunking,
+        ENICapPolicy:           cfg.ENICapPolicy,
+    }
+    if len(poolConfig.SecurityGroups) > 5 {
+        return nil, fmt.Errorf("security groups should not be more than 5, current %d", len(poolConfig.SecurityGroups))
+    }
+    ins := aliyun.GetInstanceMeta()
+    zone := ins.ZoneID
+    if cfg.VSwitches != nil {
+        zoneVswitchs, ok := cfg.VSwitches[zone]
+        if ok && len(zoneVswitchs) > 0 {
+            poolConfig.VSwitch = cfg.VSwitches[zone]
+        }
+    }
+    if len(poolConfig.VSwitch) == 0 {
+        poolConfig.VSwitch = []string{ins.VSwitchID}
+    }
+    poolConfig.ENITags = cfg.ENITags
+    poolConfig.VPC = ins.VPCID
+    poolConfig.InstanceID = ins.InstanceID
 
-		return &eni.LocalIPResource{
-			ENI: daemon.ENI{
-				ID:  item.ENIID,
-				MAC: item.ENIMAC,
-			},
-			IP: types.IPSet2{
-				IPv4: v4,
-				IPv6: v6,
-			},
-		}
-	}
-	return nil
+    return poolConfig, nil
 }
 
-func extractIPs(old daemon.ResourceItem) (ipv4, ipv6 netip.Addr, eniID string) {
-	ipv4, _ = netip.ParseAddr(old.IPv4)
-	ipv6, _ = netip.ParseAddr(old.IPv6)
-	eniID = old.ENIID
-	return ipv4, ipv6, eniID
-}
-
-func setRequest(req *eni.LocalIPRequest, old daemon.ResourceItem) {
-	ipv4, ipv6, eniID := extractIPs(old)
-	req.IPv4 = ipv4
-	req.IPv6 = ipv6
-	req.NetworkInterfaceID = eniID
-}
-
-func toRPCMapping(res eni.Status) *rpc.ResourceMapping {
-	rMapping := rpc.ResourceMapping{
-		NetworkInterfaceID:   res.NetworkInterfaceID,
-		MAC:                  res.MAC,
-		Type:                 res.Type,
-		AllocInhibitExpireAt: res.AllocInhibitExpireAt,
-		Status:               res.Status,
-	}
-
-	for _, v := range res.Usage {
-		rMapping.Info = append(rMapping.Info, strings.Join(v, "  "))
-	}
-
-	return &rMapping
+func parseExtraRoute(routes []podENITypes.Route) []*rpc.Route {
+    if routes == nil {
+        return nil
+    }
+    var res []*rpc.Route
+    for _, r := range routes {
+        res = append(res, &rpc.Route{
+            Dst: r.Dst,
+        })
+    }
+    return res
 }
 
 // set default val for netConf
 func defaultForNetConf(netConf []*rpc.NetConf) error {
-	// ignore netConf check
-	if len(netConf) == 0 {
-		return nil
-	}
-	defaultRouteSet := false
-	defaultIfSet := false
-	for i := 0; i < len(netConf); i++ {
-		if netConf[i].DefaultRoute && defaultRouteSet {
-			return fmt.Errorf("default route is dumplicated")
-		}
-		defaultRouteSet = defaultRouteSet || netConf[i].DefaultRoute
+    defaultRouteSet := false
+    defaultIfSet := false
+    for i := 0; i < len(netConf); i++ {
+        if netConf[i].DefaultRoute && defaultRouteSet {
+            return fmt.Errorf("default route is dumplicated")
+        }
+        defaultRouteSet = defaultRouteSet || netConf[i].DefaultRoute
 
-		if defaultIf(netConf[i].IfName) {
-			defaultIfSet = true
-		}
-	}
+        if defaultIf(netConf[i].IfName) {
+            defaultIfSet = true
+        }
+    }
 
-	if !defaultIfSet {
-		return fmt.Errorf("default interface is not set")
-	}
+    if !defaultIfSet {
+        return fmt.Errorf("default interface is not set")
+    }
 
-	if !defaultRouteSet {
-		for i := 0; i < len(netConf); i++ {
-			if netConf[i].IfName == "" || netConf[i].IfName == IfEth0 {
-				netConf[i].DefaultRoute = true
-				break
-			}
-		}
-	}
+    if !defaultRouteSet {
+        for i := 0; i < len(netConf); i++ {
+            if netConf[i].IfName == "" || netConf[i].IfName == "eth0" {
+                netConf[i].DefaultRoute = true
+                break
+            }
+        }
+    }
 
-	return nil
+    return nil
 }
 
 func defaultIf(name string) bool {
-	if name == "" || name == IfEth0 {
-		return true
-	}
-	return false
-}
-
-func getPodIPs(netConfs []*rpc.NetConf) []string {
-	var ips []string
-	for _, netConf := range netConfs {
-		if !defaultIf(netConf.IfName) {
-			continue
-		}
-		if netConf.BasicInfo == nil || netConf.BasicInfo.PodIP == nil {
-			continue
-		}
-		if netConf.BasicInfo.PodIP.IPv4 != "" {
-			ips = append(ips, netConf.BasicInfo.PodIP.IPv4)
-		}
-		if netConf.BasicInfo.PodIP.IPv6 != "" {
-			ips = append(ips, netConf.BasicInfo.PodIP.IPv6)
-		}
-	}
-	return ips
-}
-
-func filterENINotFound(podResources []daemon.PodResources, attachedENIID map[string]*daemon.ENI) []daemon.PodResources {
-	for i := range podResources {
-		for j := 0; j < len(podResources[i].Resources); j++ {
-			if podResources[i].Resources[j].Type == daemon.ResourceTypeENI ||
-				podResources[i].Resources[j].Type == daemon.ResourceTypeENIIP {
-
-				eniID := podResources[i].Resources[j].ENIID
-				if eniID == "" {
-					list := strings.SplitN(podResources[i].Resources[j].ID, ".", 2)
-					if len(list) == 0 {
-						continue
-					}
-					mac := list[0]
-
-					found := false
-					for _, eni := range attachedENIID {
-						if eni.MAC == mac {
-							// found
-							found = true
-							break
-						}
-					}
-					if !found {
-						podResources[i].Resources = append(podResources[i].Resources[:j], podResources[i].Resources[j+1:]...)
-					}
-				} else {
-					if _, ok := attachedENIID[eniID]; !ok {
-						podResources[i].Resources = append(podResources[i].Resources[:j], podResources[i].Resources[j+1:]...)
-					}
-				}
-			}
-		}
-	}
-	return podResources
-}
-
-func gcRoutes(links []netlink.Link, existIP sets.Set[string]) {
-	for _, link := range links {
-		routes, err := netlink.RouteList(link, netlink.FAMILY_V4)
-		if err != nil {
-			serviceLog.Error(err, "gc list route", "link", link)
-			return
-		}
-		for _, route := range routes {
-			if route.Dst == nil {
-				continue
-			}
-			// if not found
-			if existIP.Has(route.Dst.IP.String()) {
-				continue
-			}
-
-			serviceLog.Info("gc del route", "route", route)
-			err = netlink.RouteDel(&route)
-			if err != nil {
-				serviceLog.Error(err, "gc del route", "route", route)
-				return
-			}
-		}
-	}
-}
-
-func gcTCFilters(links []netlink.Link, existIP sets.Set[string]) {
-	// map ip to u32
-	toU32List := lo.Map(existIP.UnsortedList(), func(item string, index int) uint32 {
-		ip := net.ParseIP(item)
-		if ip == nil {
-			return 0
-		}
-		return binary.BigEndian.Uint32(ip.To4())
-	})
-	u32IPMap := lo.SliceToMap(toU32List, func(item uint32) (uint32, struct{}) {
-		return item, struct{}{}
-	})
-
-	for _, link := range links {
-		filters, err := netlink.FilterList(link, netlink.HANDLE_MIN_EGRESS)
-		if err != nil {
-			serviceLog.Error(err, "gc list filter", "link", link)
-			continue
-		}
-		for _, filter := range filters {
-			u32, ok := filter.(*netlink.U32)
-			if !ok {
-				continue
-			}
-			if u32.Priority != 50001 {
-				continue
-			}
-
-			if u32.Sel == nil || len(u32.Sel.Keys) != 1 {
-				continue
-			}
-			if len(u32.Actions) != 1 {
-				continue
-			}
-			_, ok = u32.Actions[0].(*netlink.VlanAction)
-			if !ok {
-				continue
-			}
-			if u32.Sel.Keys[0].Off != 12 {
-				continue
-			}
-			_, ok = u32IPMap[u32.Sel.Keys[0].Val]
-			if ok {
-				continue
-			}
-
-			serviceLog.Info("gc tc filter", "filter", filter)
-			err = netlink.FilterDel(filter)
-			if err != nil {
-				serviceLog.Error(err, "gc list filter", "link", link)
-			}
-		}
-	}
+    if name == "" || name == "eth0" {
+        return true
+    }
+    return false
 }

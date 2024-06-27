@@ -4,11 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"time"
 
 	"github.com/containernetworking/cni/pkg/skel"
 	cniTypes "github.com/containernetworking/cni/pkg/types"
-	current "github.com/containernetworking/cni/pkg/types/100"
+	"github.com/containernetworking/cni/pkg/types/current"
 	"github.com/containernetworking/plugins/pkg/ipam"
 	"github.com/containernetworking/plugins/pkg/ns"
 	"github.com/sirupsen/logrus"
@@ -29,7 +28,7 @@ func getCmdArgs(args *skel.CmdArgs) (*cniCmdArgs, error) {
 
 	var conf types.CNIConf
 	if err = json.Unmarshal(args.StdinData, &conf); err != nil {
-		return nil, cniTypes.NewError(cniTypes.ErrDecodingFailure, "failed to parse network config", err.Error())
+		return nil, fmt.Errorf("error parse args, %w", err)
 	}
 	if conf.MTU == 0 {
 		conf.MTU = defaultMTU
@@ -37,7 +36,7 @@ func getCmdArgs(args *skel.CmdArgs) (*cniCmdArgs, error) {
 
 	var k8sArgs types.K8SArgs
 	if err = cniTypes.LoadArgs(args.Args, &k8sArgs); err != nil {
-		return nil, cniTypes.NewError(cniTypes.ErrDecodingFailure, "failed to parse args", err.Error())
+		return nil, fmt.Errorf("error parse args, %w", err)
 	}
 
 	return &cniCmdArgs{
@@ -101,7 +100,6 @@ func isNSPathNotExist(err error) bool {
 func doCmdAdd(ctx context.Context, logger *logrus.Entry, client rpc.TerwayBackendClient, cmdArgs *cniCmdArgs) (containerIPNet *terwayTypes.IPNetSet, gatewayIPSet *terwayTypes.IPSet, err error) {
 	var conf, cniNetns, k8sConfig, args = cmdArgs.conf, cmdArgs.netNS, cmdArgs.k8sArgs, cmdArgs.inputArgs
 
-	start := time.Now()
 	defer func() {
 		eventCtx, cancel := context.WithTimeout(context.Background(), defaultEventTimeout)
 		defer cancel()
@@ -121,7 +119,7 @@ func doCmdAdd(ctx context.Context, logger *logrus.Entry, client rpc.TerwayBacken
 				K8SPodNamespace: string(k8sConfig.K8S_POD_NAMESPACE),
 				EventType:       rpc.EventType_EventTypeNormal,
 				Reason:          "AllocIPSucceed",
-				Message:         fmt.Sprintf("Alloc IP %s took %s", containerIPNet.String(), time.Since(start).String()),
+				Message:         fmt.Sprintf("Alloc IP %s", containerIPNet.String()),
 			})
 		}
 	}()
@@ -157,11 +155,6 @@ func doCmdAdd(ctx context.Context, logger *logrus.Entry, client rpc.TerwayBacken
 	}()
 
 	ipv4, ipv6 := allocResult.IPv4, allocResult.IPv6
-
-	if !ipv4 && !ipv6 {
-		err = fmt.Errorf("cmdAdd: alloc ip no valid ip type")
-		return
-	}
 
 	hostIPSet, err := utils.GetHostIP(ipv4, ipv6)
 	if err != nil {
@@ -381,15 +374,8 @@ func doCmdDel(ctx context.Context, logger *logrus.Entry, client rpc.TerwayBacken
 						if err != nil {
 							return err
 						}
-						continue
+						break
 					}
-				}
-				fallthrough
-			case types.PolicyRoute:
-				utils.Hook.AddExtraInfo("dp", "policyRoute")
-				err = datapath.NewPolicyRoute().Teardown(teardownCfg, cniNetns)
-				if err != nil {
-					return err
 				}
 			}
 		}
@@ -426,9 +412,6 @@ func doCmdCheck(ctx context.Context, logger *logrus.Entry, client rpc.TerwayBack
 	}
 
 	ipv4, ipv6 := getResult.IPv4, getResult.IPv6
-	if !ipv4 && !ipv6 {
-		return fmt.Errorf("cmdCheck: no valid ip type")
-	}
 
 	hostIPSet, err := utils.GetHostIP(ipv4, ipv6)
 	if err != nil {

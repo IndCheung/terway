@@ -5,9 +5,7 @@ import (
 	"strings"
 
 	"github.com/AliyunContainerService/terway/rpc"
-
 	"github.com/pterm/pterm"
-	"github.com/pterm/pterm/putils"
 )
 
 type tree struct {
@@ -79,7 +77,7 @@ func printPTermTree(m []*rpc.MapKeyValueEntry) error {
 	list := pterm.LeveledList{}
 	list = t.leveledList(list, 0)
 
-	root := putils.TreeFromLeveledList(list)
+	root := pterm.NewTreeFromLeveledList(list)
 	return pterm.DefaultTree.
 		WithTextStyle(&pterm.ThemeDefault.BarLabelStyle).
 		WithRoot(root).

@@ -1,12 +1,32 @@
 package utils
 
 import (
-	"fmt"
 	"time"
+
+	networkingclientset "github.com/AliyunContainerService/terway/pkg/generated/clientset/versioned"
+	apiextensionsclient "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 )
+
+// K8sClient k8s client set
+var K8sClient kubernetes.Interface
+
+// APIExtensionsClient k8s client set
+var APIExtensionsClient apiextensionsclient.Interface
+
+// NetworkClient network client set
+var NetworkClient networkingclientset.Interface
+
+// RegisterClients create all k8s clients
+func RegisterClients(restConfig *rest.Config) {
+	K8sClient = kubernetes.NewForConfigOrDie(restConfig)
+	APIExtensionsClient = apiextensionsclient.NewForConfigOrDie(restConfig)
+	NetworkClient = networkingclientset.NewForConfigOrDie(restConfig)
+}
 
 var stsKinds = []string{"StatefulSet"}
 
@@ -15,11 +35,8 @@ func SetStsKinds(kids []string) {
 	stsKinds = append(stsKinds, kids...)
 }
 
-// IsFixedNamePod pod is sts
-func IsFixedNamePod(pod *corev1.Pod) bool {
-	if len(pod.GetObjectMeta().GetOwnerReferences()) == 0 {
-		return true
-	}
+// IsStsPod pod is sts
+func IsStsPod(pod *corev1.Pod) bool {
 	for _, own := range pod.GetObjectMeta().GetOwnerReferences() {
 		for _, kind := range stsKinds {
 			if own.Kind == kind {
@@ -40,9 +57,14 @@ func IsDaemonSetPod(pod *corev1.Pod) bool {
 	return false
 }
 
-// ISVKNode node is run by virtual kubelet
-func ISVKNode(n *corev1.Node) bool {
-	return n.Labels["type"] == "virtual-kubelet"
+// IsJobPod pod is create by Job
+func IsJobPod(pod *corev1.Pod) bool {
+	for _, own := range pod.GetObjectMeta().GetOwnerReferences() {
+		if own.Kind == "Job" {
+			return true
+		}
+	}
+	return false
 }
 
 // PodSandboxExited pod sandbox is exited
@@ -53,10 +75,6 @@ func PodSandboxExited(p *corev1.Pod) bool {
 	default:
 		return false
 	}
-}
-
-func PodInfoKey(namespace, name string) string {
-	return fmt.Sprintf("%s/%s", namespace, name)
 }
 
 var (

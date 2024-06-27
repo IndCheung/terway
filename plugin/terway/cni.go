@@ -7,11 +7,7 @@ import (
 	"runtime"
 	"time"
 
-	"google.golang.org/grpc/backoff"
-	"google.golang.org/grpc/credentials/insecure"
-
 	"github.com/AliyunContainerService/terway/pkg/link"
-	"github.com/AliyunContainerService/terway/plugin/datapath"
 	"github.com/AliyunContainerService/terway/plugin/driver/types"
 	"github.com/AliyunContainerService/terway/plugin/driver/utils"
 	"github.com/AliyunContainerService/terway/rpc"
@@ -19,7 +15,7 @@ import (
 
 	"github.com/containernetworking/cni/pkg/skel"
 	cniTypes "github.com/containernetworking/cni/pkg/types"
-	current "github.com/containernetworking/cni/pkg/types/100"
+	"github.com/containernetworking/cni/pkg/types/current"
 	"github.com/containernetworking/cni/pkg/version"
 	bv "github.com/containernetworking/plugins/pkg/utils/buildversion"
 	"google.golang.org/grpc"
@@ -28,7 +24,6 @@ import (
 const (
 	defaultSocketPath   = "/var/run/eni/eni.socket"
 	defaultVethPrefix   = "cali"
-	defaultDialTimeout  = 10 * time.Second
 	defaultCniTimeout   = 120 * time.Second
 	defaultEventTimeout = 10 * time.Second
 	delegateIpam        = "host-local"
@@ -36,7 +31,7 @@ const (
 	delegateConf        = `
 {
 	"name": "networks",
-    "cniVersion": "0.4.0",
+    "cniVersion": "0.3.1",
 	"ipam": {
 		"type": "host-local",
 		"subnet": "%s",
@@ -56,7 +51,7 @@ func init() {
 }
 
 func main() {
-	skel.PluginMain(cmdAdd, cmdCheck, cmdDel, version.PluginSupports("0.3.0", "0.3.1", "0.4.0", "1.0.0"), bv.BuildString("terway"))
+	skel.PluginMain(cmdAdd, cmdCheck, cmdDel, version.PluginSupports("0.3.0", "0.3.1", "0.4.0"), bv.BuildString("terway"))
 }
 
 func cmdAdd(args *skel.CmdArgs) error {
@@ -86,7 +81,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 
 	client, conn, err := getNetworkClient(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("error create grpc client, %w", err)
 	}
 	defer conn.Close()
 
@@ -97,17 +92,17 @@ func cmdAdd(args *skel.CmdArgs) error {
 	containerIPNet, gatewayIPSet, err = doCmdAdd(ctx, logger, client, cmdArgs)
 	if err != nil {
 		logger.WithError(err).Error("error adding")
-		return cniTypes.NewError(cniTypes.ErrTryAgainLater, "failed to do add", err.Error())
+		return err
 	}
 
 	result := &current.Result{}
 
 	result.Interfaces = append(result.Interfaces, &current.Interface{
-		Name:    args.IfName,
-		Sandbox: string(k8sConfig.K8S_POD_INFRA_CONTAINER_ID),
+		Name: args.IfName,
 	})
 	if containerIPNet.IPv4 != nil && gatewayIPSet.IPv4 != nil {
 		result.IPs = append(result.IPs, &current.IPConfig{
+			Version:   "4",
 			Address:   *containerIPNet.IPv4,
 			Gateway:   gatewayIPSet.IPv4,
 			Interface: current.Int(0),
@@ -115,6 +110,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 	}
 	if containerIPNet.IPv6 != nil && gatewayIPSet.IPv6 != nil {
 		result.IPs = append(result.IPs, &current.IPConfig{
+			Version:   "6",
 			Address:   *containerIPNet.IPv6,
 			Gateway:   gatewayIPSet.IPv6,
 			Interface: current.Int(0),
@@ -161,7 +157,7 @@ func cmdDel(args *skel.CmdArgs) error {
 	err = doCmdDel(ctx, logger, client, cmdArgs)
 	if err != nil {
 		logger.WithError(err).Error("error deleting")
-		return cniTypes.NewError(cniTypes.ErrTryAgainLater, "failed to do del", err.Error())
+		return err
 	}
 
 	return cniTypes.PrintResult(&current.Result{
@@ -215,29 +211,17 @@ func cmdCheck(args *skel.CmdArgs) error {
 }
 
 func getNetworkClient(ctx context.Context) (rpc.TerwayBackendClient, *grpc.ClientConn, error) {
-	ctx, parent := context.WithTimeout(ctx, defaultDialTimeout)
-	defer parent()
-	conn, err := grpc.DialContext(ctx, defaultSocketPath, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithContextDialer(
+	conn, err := grpc.DialContext(ctx, defaultSocketPath, grpc.WithInsecure(), grpc.WithContextDialer(
 		func(ctx context.Context, s string) (net.Conn, error) {
-			unixAddr, err := net.ResolveUnixAddr("unix", s)
+			unixAddr, err := net.ResolveUnixAddr("unix", defaultSocketPath)
 			if err != nil {
-				return nil, err
+				return nil, fmt.Errorf("error resolve addr, %w", err)
 			}
 			d := net.Dialer{}
 			return d.DialContext(ctx, "unix", unixAddr.String())
-		}),
-		grpc.WithBlock(),
-		grpc.WithConnectParams(grpc.ConnectParams{
-			Backoff: backoff.Config{
-				BaseDelay:  time.Second,
-				Multiplier: 1,
-				MaxDelay:   time.Second,
-			},
-		}),
-	)
-
+		}))
 	if err != nil {
-		return nil, nil, cniTypes.NewError(cniTypes.ErrTryAgainLater, "failed connect to daemon", err.Error())
+		return nil, nil, fmt.Errorf("error dial to terway %s, terway pod may staring, %w", defaultSocketPath, err)
 	}
 
 	client := rpc.NewTerwayBackendClient(conn)
@@ -250,14 +234,12 @@ func parseSetupConf(args *skel.CmdArgs, alloc *rpc.NetConf, conf *types.CNIConf,
 		containerIPNet *terwayTypes.IPNetSet
 		gatewayIP      *terwayTypes.IPSet
 		serviceCIDR    *terwayTypes.IPNetSet
-		eniGatewayIP   *terwayTypes.IPSet
 		deviceID       int32
 		trunkENI       bool
 		vid            uint32
 
-		ingress         uint64
-		egress          uint64
-		networkPriority uint32
+		ingress uint64
+		egress  uint64
 
 		routes []cniTypes.Route
 
@@ -305,23 +287,10 @@ func parseSetupConf(args *skel.CmdArgs, alloc *rpc.NetConf, conf *types.CNIConf,
 		}
 		trunkENI = alloc.GetENIInfo().GetTrunk()
 		vid = alloc.GetENIInfo().GetVid()
-		if alloc.GetENIInfo().GetGatewayIP() != nil {
-			eniGatewayIP, err = terwayTypes.ToIPSet(alloc.GetENIInfo().GetGatewayIP())
-			if err != nil {
-				return nil, err
-			}
-		}
 	}
 	if alloc.GetPod() != nil {
 		ingress = alloc.GetPod().GetIngress()
 		egress = alloc.GetPod().GetEgress()
-		networkPriority = datapath.PrioMap[alloc.GetPod().GetNetworkPriority()]
-	}
-	if conf.RuntimeConfig.Bandwidth.EgressRate > 0 {
-		egress = uint64(conf.RuntimeConfig.Bandwidth.EgressRate / 8)
-	}
-	if conf.RuntimeConfig.Bandwidth.IngressRate > 0 {
-		ingress = uint64(conf.RuntimeConfig.Bandwidth.IngressRate / 8)
 	}
 
 	hostStackCIDRs := make([]*net.IPNet, 0)
@@ -354,26 +323,22 @@ func parseSetupConf(args *skel.CmdArgs, alloc *rpc.NetConf, conf *types.CNIConf,
 
 	dp := getDatePath(ipType, conf.VlanStripType, trunkENI)
 	return &types.SetupConfig{
-		DP:                    dp,
-		ContainerIfName:       name,
-		ContainerIPNet:        containerIPNet,
-		GatewayIP:             gatewayIP,
-		MTU:                   conf.MTU,
-		ENIIndex:              int(deviceID),
-		ENIGatewayIP:          eniGatewayIP,
-		ServiceCIDR:           serviceCIDR,
-		HostStackCIDRs:        hostStackCIDRs,
-		BandwidthMode:         conf.BandwidthMode,
-		EnableNetworkPriority: conf.EnableNetworkPriority,
-		Ingress:               ingress,
-		Egress:                egress,
-		StripVlan:             trunkENI,
-		Vid:                   int(vid),
-		DefaultRoute:          alloc.GetDefaultRoute(),
-		ExtraRoutes:           routes,
-		DisableCreatePeer:     disableCreatePeer,
-		RuntimeConfig:         conf.RuntimeConfig,
-		NetworkPriority:       networkPriority,
+		DP:                dp,
+		ContainerIfName:   name,
+		ContainerIPNet:    containerIPNet,
+		GatewayIP:         gatewayIP,
+		MTU:               conf.MTU,
+		ENIIndex:          int(deviceID),
+		ServiceCIDR:       serviceCIDR,
+		HostStackCIDRs:    hostStackCIDRs,
+		Ingress:           ingress,
+		Egress:            egress,
+		StripVlan:         trunkENI,
+		Vid:               int(vid),
+		DefaultRoute:      alloc.GetDefaultRoute(),
+		ExtraRoutes:       routes,
+		DisableCreatePeer: disableCreatePeer,
+		RuntimeConfig:     conf.RuntimeConfig,
 	}, nil
 }
 
@@ -386,7 +351,6 @@ func parseTearDownConf(alloc *rpc.NetConf, conf *types.CNIConf, ipType rpc.IPTyp
 		err            error
 		containerIPNet *terwayTypes.IPNetSet
 		serviceCIDR    *terwayTypes.IPNetSet
-		eniIndex       int32
 	)
 
 	serviceCIDR, err = terwayTypes.ToIPNetSet(alloc.GetBasicInfo().GetServiceCIDR())
@@ -413,20 +377,12 @@ func parseTearDownConf(alloc *rpc.NetConf, conf *types.CNIConf, ipType rpc.IPTyp
 			return nil, err
 		}
 	}
-	if alloc.GetENIInfo() != nil {
-		mac := alloc.GetENIInfo().GetMAC()
-		if mac != "" {
-			eniIndex, _ = link.GetDeviceNumber(mac)
-		}
-	}
 
 	dp := getDatePath(ipType, conf.VlanStripType, false)
 	return &types.TeardownCfg{
-		DP:                    dp,
-		ContainerIPNet:        containerIPNet,
-		ServiceCIDR:           serviceCIDR,
-		ENIIndex:              int(eniIndex),
-		EnableNetworkPriority: conf.EnableNetworkPriority,
+		DP:             dp,
+		ContainerIPNet: containerIPNet,
+		ServiceCIDR:    serviceCIDR,
 	}, nil
 }
 

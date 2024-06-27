@@ -18,11 +18,11 @@
 package powershell
 
 import (
-	"encoding/json"
-	"errors"
-	"fmt"
-	"os/exec"
-	"strings"
+    "encoding/json"
+    "errors"
+    "fmt"
+    "os/exec"
+    "strings"
 )
 
 // commandWrapper ensures that exceptions are written to stdout and the powershell process exit code is -1
@@ -30,30 +30,36 @@ const commandWrapper = `$ErrorActionPreference="Stop";try { %s } catch { Write-H
 
 // RunCommand executes a given powershell command.
 func RunCommand(command string) ([]byte, error) {
-	var s = fmt.Sprintf(commandWrapper, command)
-	var cmd = exec.Command("powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", s)
-	var stdout, err = cmd.Output()
-	if err != nil {
-		if cmd.ProcessState.ExitCode() != 0 {
-			var message = strings.TrimSpace(string(stdout))
-			return nil, errors.New(message)
-		}
-		return nil, err
-	}
-	return stdout, nil
+    cmd := exec.Command("powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", fmt.Sprintf(commandWrapper, command))
+    var stdout, err = cmd.Output()
+    if err != nil {
+        if cmd.ProcessState.ExitCode() != 0 {
+            message := fmt.Sprintf("error: %v while running the command: %v.", err, cmd) + " Command output: " + strings.TrimSpace(string(stdout))
+            return []byte{}, errors.New(message)
+        }
+        return []byte{}, err
+    }
+    return stdout, nil
+}
+
+// RunCommandf executes a given powershell command. Command argument formats according to a format specifier (See fmt.Sprintf).
+//
+// When the command throws a powershell exception, RunCommandf will return the exception message as error.
+func RunCommandf(command string, a ...interface{}) ([]byte, error) {
+    return RunCommand(fmt.Sprintf(command, a...))
 }
 
 // RunCommandWithJsonResult executes a given powershell command.
 func RunCommandWithJsonResult(command string, v interface{}) error {
-	var s = fmt.Sprintf(commandWrapper, "ConvertTo-Json (%s)")
-	s = fmt.Sprintf(s, command)
-	var stdout, err = RunCommand(s)
-	if err != nil {
-		return err
-	}
-	err = json.Unmarshal(stdout, v)
-	if err != nil {
-		return err
-	}
-	return nil
+    var s = fmt.Sprintf(commandWrapper, "ConvertTo-Json (%s)")
+    s = fmt.Sprintf(s, command)
+    var stdout, err = RunCommandf(s)
+    if err != nil {
+        return fmt.Errorf("error while executing command: %w", err)
+    }
+    err = json.Unmarshal(stdout, v)
+    if err != nil {
+        return fmt.Errorf("error while unmarshalling stdout: %w", err)
+    }
+    return nil
 }

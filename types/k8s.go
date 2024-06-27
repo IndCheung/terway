@@ -17,7 +17,6 @@ limitations under the License.
 package types
 
 import (
-	"fmt"
 	"strconv"
 
 	corev1 "k8s.io/api/core/v1"
@@ -25,7 +24,6 @@ import (
 
 // AnnotationPrefix is the annotation prefix
 const AnnotationPrefix = "k8s.aliyun.com/"
-const LabelPrefix = "k8s.aliyun.com/"
 
 // annotations used by terway
 const (
@@ -45,22 +43,8 @@ const (
 	// PodAllocType for additional net config
 	PodAllocType = AnnotationPrefix + "pod-alloc-type"
 
-	// PodENIAllocated pod annotation for allocated eni
-	PodENIAllocated = AnnotationPrefix + "allocated"
-
 	// PodUID store pod uid
 	PodUID = AnnotationPrefix + "pod-uid"
-
-	// NetworkPriority set pod network priority
-	NetworkPriority = AnnotationPrefix + "network-priority"
-
-	ENIAllocFromPool   = AnnotationPrefix + "eni-alloc-from-pool"
-	ENIRelatedNodeName = AnnotationPrefix + "node"
-
-	PodIPs = AnnotationPrefix + "pod-ips"
-
-	// IgnoreByTerway if the label exist , terway will not handle this kind of res
-	IgnoreByTerway = LabelPrefix + "ignore-by-terway"
 )
 
 // FinalizerPodENI finalizer for podENI resource
@@ -95,45 +79,4 @@ func PodUseENI(pod *corev1.Pod) bool {
 		return false
 	}
 	return v
-}
-
-// IgnoredByTerway for both pods and nodes
-func IgnoredByTerway(labels map[string]string) bool {
-	return labels[IgnoreByTerway] == "true"
-}
-
-// NetworkPrio network priority for pod
-type NetworkPrio string
-
-// NetworkPrio val
-const (
-	NetworkPrioBestEffort NetworkPrio = "best-effort"
-	NetworkPrioBurstable  NetworkPrio = "burstable"
-	NetworkPrioGuaranteed NetworkPrio = "guaranteed"
-)
-
-// PodIPTypeIPs Pod IP address type
-type PodIPTypeIPs string
-
-// PodIPTypeIPs val
-const (
-	NormalIPTypeIPs    PodIPTypeIPs = AnnotationPrefix + "max-available-ip"
-	MemberENIIPTypeIPs PodIPTypeIPs = AnnotationPrefix + "max-member-eni-ip"
-	ERDMAIPTypeIPs     PodIPTypeIPs = AnnotationPrefix + "max-erdma-ip"
-)
-
-// SufficientIPCondition definitions
-const (
-	SufficientIPCondition   corev1.NodeConditionType = "SufficientIP"
-	IPResInsufficientReason string                   = "InsufficientIP"
-	IPResSufficientReason   string                   = "SufficientIP"
-)
-
-type IPInsufficientError struct {
-	Err    error
-	Reason string
-}
-
-func (e *IPInsufficientError) Error() string {
-	return fmt.Sprintf("ip insufficient error: %v with reason: %s", e.Err, e.Reason)
 }

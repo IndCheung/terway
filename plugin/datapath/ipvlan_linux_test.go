@@ -1,4 +1,5 @@
 //go:build privileged
+// +build privileged
 
 package datapath
 
@@ -285,7 +286,6 @@ func TestDataPathIPvlanL2(t *testing.T) {
 			IPv4: containerIPNet,
 			IPv6: containerIPNetIPv6,
 		},
-		ENIIndex: eni.Attrs().Index,
 	}, containerNS)
 	assert.NoError(t, err)
 

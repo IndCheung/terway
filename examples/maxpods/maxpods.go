@@ -3,15 +3,14 @@ package main
 import (
 	"flag"
 	"fmt"
-	"io"
+	"io/ioutil"
 	"log"
 
-	"github.com/sirupsen/logrus"
-	"k8s.io/client-go/util/flowcontrol"
-
 	"github.com/AliyunContainerService/terway/pkg/aliyun/client"
-	"github.com/AliyunContainerService/terway/pkg/aliyun/credential"
-	"github.com/AliyunContainerService/terway/pkg/aliyun/instance"
+	"github.com/AliyunContainerService/terway/types"
+	"github.com/sirupsen/logrus"
+
+	"github.com/AliyunContainerService/terway/pkg/aliyun"
 )
 
 var (
@@ -34,37 +33,35 @@ func init() {
 
 func main() {
 	flag.Parse()
-	log.SetOutput(io.Discard)
-	logrus.SetOutput(io.Discard)
-	ins := instance.GetInstanceMeta()
-
-	providers := []credential.Interface{
-		credential.NewAKPairProvider(accessKeyID, accessKeySecret),
-		credential.NewEncryptedCredentialProvider(credentialPath, "", ""),
-		credential.NewMetadataProvider(),
-	}
-
-	c, err := credential.NewClientMgr(ins.RegionID, providers...)
+	log.SetOutput(ioutil.Discard)
+	logrus.SetOutput(ioutil.Discard)
+	ins := aliyun.GetInstanceMeta()
+	api, err := client.NewAliyun(accessKeyID, accessKeySecret, ins.RegionID, credentialPath, "", "")
 	if err != nil {
 		panic(err)
 	}
 
-	api, err := client.New(c,
-		flowcontrol.NewTokenBucketRateLimiter(8, 10),
-		flowcontrol.NewTokenBucketRateLimiter(4, 5))
+	f := &types.IPFamily{}
+	if ipStack == "ipv4" || ipStack == "dual" {
+		f.IPv4 = true
+	}
+	if ipStack == "dual" || ipStack == "ipv6" {
+		f.IPv6 = true
+	}
+
+	err = aliyun.UpdateFromAPI(api.ClientSet.ECS(), aliyun.GetInstanceMeta().InstanceType)
 	if err != nil {
 		panic(err)
 	}
-
 	if mode == "terway-eniip" {
-		limit, err := client.GetLimit(api, instance.GetInstanceMeta().InstanceType)
-		if err != nil {
+		limit, ok := aliyun.GetLimit(aliyun.GetInstanceMeta().InstanceType)
+		if !ok {
 			panic(err)
 		}
 		fmt.Println(limit.IPv4PerAdapter * (limit.Adapters - 1))
 	} else if mode == "terway-eni" {
-		limit, err := client.GetLimit(api, instance.GetInstanceMeta().InstanceType)
-		if err != nil {
+		limit, ok := aliyun.GetLimit(aliyun.GetInstanceMeta().InstanceType)
+		if !ok {
 			panic(err)
 		}
 		fmt.Println(limit.Adapters - 1)

@@ -7,6 +7,7 @@ import (
 	"github.com/AliyunContainerService/terway/plugin/terway/cni"
 	terwayTypes "github.com/AliyunContainerService/terway/types"
 
+	"github.com/containernetworking/cni/pkg/types"
 	cniTypes "github.com/containernetworking/cni/pkg/types"
 )
 
@@ -32,11 +33,6 @@ type CNIConf struct {
 
 	// RuntimeConfig represents the options to be passed in by the runtime.
 	RuntimeConfig cni.RuntimeConfig `json:"runtimeConfig"`
-
-	BandwidthMode string `json:"bandwidth_mode"`
-
-	// EnableNetworkPriority by enable priority control, eni qdisc is replaced with tc_prio
-	EnableNetworkPriority bool `json:"enable_network_priority"`
 
 	// Debug
 	Debug bool `json:"debug"`
@@ -87,7 +83,6 @@ type SetupConfig struct {
 	GatewayIP       *terwayTypes.IPSet
 	MTU             int
 	ENIIndex        int
-	ENIGatewayIP    *terwayTypes.IPSet
 
 	// disable create peer for exclusiveENI
 	DisableCreatePeer bool
@@ -100,19 +95,15 @@ type SetupConfig struct {
 	MultiNetwork bool
 
 	// add extra route in container
-	ExtraRoutes []cniTypes.Route
+	ExtraRoutes []types.Route
 
 	ServiceCIDR *terwayTypes.IPNetSet
 	HostIPSet   *terwayTypes.IPNetSet
 	// ipvlan
 	HostStackCIDRs []*net.IPNet
 
-	BandwidthMode string
-	Ingress       uint64
-	Egress        uint64
-
-	EnableNetworkPriority bool
-	NetworkPriority       uint32
+	Ingress uint64
+	Egress  uint64
 
 	RuntimeConfig cni.RuntimeConfig
 
@@ -126,12 +117,8 @@ type TeardownCfg struct {
 
 	HostVETHName string
 
-	ENIIndex int
-
 	ContainerIfName string
 	ContainerIPNet  *terwayTypes.IPNetSet
 
 	ServiceCIDR *terwayTypes.IPNetSet
-
-	EnableNetworkPriority bool
 }

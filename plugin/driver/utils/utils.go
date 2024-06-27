@@ -1,7 +1,6 @@
 package utils
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,7 +11,6 @@ import (
 	"github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/util/wait"
 
-	"github.com/AliyunContainerService/terway/pkg/logger"
 	"github.com/AliyunContainerService/terway/pkg/utils"
 )
 
@@ -23,13 +21,24 @@ const (
 // Log for default log
 var Log = DefaultLogger.WithField("subSys", "terway-cni")
 
+// DefaultLogger default log
+var DefaultLogger = NewDefaultLogger()
+
 // Hook for log
 var Hook = &PodInfoHook{ExtraInfo: make(map[string]string)}
-var DefaultLogger = func() *logrus.Logger {
-	l := logger.NewDefaultLogger()
-	l.AddHook(Hook)
-	return l
-}()
+
+func NewDefaultLogger() *logrus.Logger {
+	logger := logrus.New()
+	logger.Formatter = &logrus.TextFormatter{
+		DisableTimestamp: true,
+		DisableColors:    true,
+		DisableQuote:     true,
+	}
+	logger.SetLevel(logrus.InfoLevel)
+
+	logger.AddHook(Hook)
+	return logger
+}
 
 type PodInfoHook struct {
 	ExtraInfo map[string]string
@@ -94,7 +103,7 @@ func GrabFileLock(lockfilePath string) (*Locker, error) {
 		return nil, fmt.Errorf("failed to open lock %s: %v", lockfilePath, err)
 	}
 
-	err = wait.PollUntilContextTimeout(context.Background(), 200*time.Millisecond, fileLockTimeOut, true, func(ctx context.Context) (bool, error) {
+	err = wait.PollImmediate(200*time.Millisecond, fileLockTimeOut, func() (bool, error) {
 		if err := m.Lock(); err != nil {
 			return false, nil
 		}

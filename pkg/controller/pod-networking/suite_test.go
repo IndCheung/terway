@@ -1,37 +1,41 @@
+//go:build test_env
+// +build test_env
+
 package podnetworking
 
 import (
-	"fmt"
+	"context"
 	"path/filepath"
-	"runtime"
 	"testing"
 
-	corev1 "k8s.io/api/core/v1"
+	"github.com/AliyunContainerService/terway/pkg/aliyun/client/fake"
+	networkv1beta1 "github.com/AliyunContainerService/terway/pkg/apis/network.alibabacloud.com/v1beta1"
+	register "github.com/AliyunContainerService/terway/pkg/controller"
+	"github.com/AliyunContainerService/terway/pkg/controller/vswitch"
 
-	. "github.com/onsi/ginkgo/v2"
+	"github.com/aliyun/alibaba-cloud-sdk-go/services/vpc"
+	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
+	"sigs.k8s.io/controller-runtime/pkg/envtest/printer"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
-
-	networkv1beta1 "github.com/AliyunContainerService/terway/pkg/apis/network.alibabacloud.com/v1beta1"
-	"github.com/AliyunContainerService/terway/pkg/controller/mocks"
 )
 
 var cfg *rest.Config
 var k8sClient client.Client
 var testEnv *envtest.Environment
-var openAPI *mocks.Interface
 
 func TestAPIs(t *testing.T) {
 	RegisterFailHandler(Fail)
 
-	openAPI = mocks.NewInterface(t)
-
-	RunSpecs(t, "Controller Suite")
+	RunSpecsWithDefaultAndCustomReporters(t,
+		"Controller Suite",
+		[]Reporter{printer.NewlineReporter{}})
 }
 
 var _ = BeforeSuite(func() {
@@ -41,27 +45,45 @@ var _ = BeforeSuite(func() {
 	testEnv = &envtest.Environment{
 		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "apis", "crds")},
 		ErrorIfCRDPathMissing: true,
-		BinaryAssetsDirectory: filepath.Join("..", "..", "..", "bin", "k8s",
-			fmt.Sprintf("1.29.0-%s-%s", runtime.GOOS, runtime.GOARCH)),
 	}
 
-	var err error
-	// cfg is defined in this file globally.
-	cfg, err = testEnv.Start()
+	cfg, err := testEnv.Start()
 	Expect(err).NotTo(HaveOccurred())
 	Expect(cfg).NotTo(BeNil())
 
-	err = corev1.AddToScheme(scheme.Scheme)
 	err = networkv1beta1.AddToScheme(scheme.Scheme)
 	Expect(err).NotTo(HaveOccurred())
-
-	//+kubebuilder:scaffold:scheme
 
 	k8sClient, err = client.New(cfg, client.Options{Scheme: scheme.Scheme})
 	Expect(err).NotTo(HaveOccurred())
 	Expect(k8sClient).NotTo(BeNil())
 
-})
+	k8sManager, err := ctrl.NewManager(cfg, ctrl.Options{
+		Scheme: scheme.Scheme,
+	})
+	Expect(err).ToNot(HaveOccurred())
+
+	vsw, err := vswitch.NewSwitchPool(1000, "100m")
+	Expect(err).ToNot(HaveOccurred())
+
+	fakeClient := &fake.OpenAPI{
+		VSwitches: map[string]vpc.VSwitch{
+			"vsw-1": {
+				VSwitchId:               "vsw-1",
+				AvailableIpAddressCount: 100,
+			},
+		},
+	}
+	err = register.Controllers[controllerName](k8sManager, fakeClient, vsw)
+	Expect(err).ToNot(HaveOccurred())
+
+	go func() {
+		defer GinkgoRecover()
+		err = k8sManager.Start(context.Background())
+		Expect(err).ToNot(HaveOccurred(), "failed to run manager")
+	}()
+
+}, 5)
 
 var _ = AfterSuite(func() {
 	By("tearing down the test environment")

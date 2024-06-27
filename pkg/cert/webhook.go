@@ -7,6 +7,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"math/big"
@@ -14,19 +15,14 @@ import (
 	"path/filepath"
 	"time"
 
-	"sigs.k8s.io/controller-runtime/pkg/client"
+	"github.com/AliyunContainerService/terway/pkg/utils"
 
-	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
-
-	"github.com/AliyunContainerService/terway/pkg/logger"
-	"github.com/AliyunContainerService/terway/pkg/utils"
 )
-
-var log = logger.DefaultLogger.WithField("subSys", "webhook-cert")
 
 const (
 	serverCertKey = "tls.crt"
@@ -36,14 +32,14 @@ const (
 )
 
 // SyncCert sync cert for webhook
-func SyncCert(ctx context.Context, c client.Client, ns, name, domain, certDir string) error {
+func SyncCert(ns, name, domain, certDir string) error {
 	secretName := fmt.Sprintf("%s-webhook-cert", name)
+	cs := utils.K8sClient
 	// check secret
 	var serverCertBytes, serverKeyBytes, caCertBytes []byte
 
 	// get cert from secret or generate it
-	existSecret := &corev1.Secret{}
-	err := c.Get(ctx, types.NamespacedName{Namespace: ns, Name: secretName}, existSecret)
+	existSecret, err := cs.CoreV1().Secrets(ns).Get(context.Background(), secretName, metav1.GetOptions{})
 	if err != nil {
 		if !errors.IsNotFound(err) {
 			return fmt.Errorf("error get cert from secret, %w", err)
@@ -60,14 +56,12 @@ func SyncCert(ctx context.Context, c client.Client, ns, name, domain, certDir st
 		s.Name = secretName
 		s.Namespace = ns
 		// create secret this make sure one is the leader
-		err = c.Create(ctx, s)
+		_, err = cs.CoreV1().Secrets(ns).Create(context.Background(), s, metav1.CreateOptions{})
 		if err != nil {
 			if !errors.IsAlreadyExists(err) {
 				return fmt.Errorf("error create cert to secret, %w", err)
 			}
-
-			secret := &corev1.Secret{}
-			err = c.Get(ctx, types.NamespacedName{Namespace: ns, Name: secretName}, secret)
+			secret, err := cs.CoreV1().Secrets(ns).Get(context.Background(), secretName, metav1.GetOptions{})
 			if err != nil {
 				return fmt.Errorf("error get cert from secret, %w", err)
 			}
@@ -79,9 +73,6 @@ func SyncCert(ctx context.Context, c client.Client, ns, name, domain, certDir st
 		serverCertBytes = existSecret.Data[serverCertKey]
 		serverKeyBytes = existSecret.Data[serverKeyKey]
 		caCertBytes = existSecret.Data[caCertKey]
-	}
-	if len(serverCertBytes) == 0 || len(serverKeyBytes) == 0 || len(caCertBytes) == 0 {
-		return fmt.Errorf("invalid cert")
 	}
 
 	err = os.MkdirAll(certDir, os.ModeDir)
@@ -104,74 +95,64 @@ func SyncCert(ctx context.Context, c client.Client, ns, name, domain, certDir st
 	}
 
 	// update webhook
-	mutatingWebhook := &admissionregistrationv1.MutatingWebhookConfiguration{}
-	err = c.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, mutatingWebhook)
+	mutatingWebhook, err := cs.AdmissionregistrationV1().MutatingWebhookConfigurations().Get(context.Background(), name, metav1.GetOptions{})
 	if err != nil {
 		return err
 	}
 	if len(mutatingWebhook.Webhooks) == 0 {
 		return fmt.Errorf("no webhook config found")
 	}
-	oldMutatingWebhook := mutatingWebhook.DeepCopy()
-	changed := false
+	mutatingCfg := mutatingWebhook.DeepCopy()
 	for i, hook := range mutatingWebhook.Webhooks {
 		if len(hook.ClientConfig.CABundle) != 0 {
 			continue
 		}
-		changed = true
 		// patch ca
-		mutatingWebhook.Webhooks[i].ClientConfig.CABundle = caCertBytes
+		mutatingCfg.Webhooks[i].ClientConfig.CABundle = caCertBytes
 	}
-	if changed {
-		err = wait.ExponentialBackoffWithContext(ctx, utils.DefaultPatchBackoff, func(ctx context.Context) (done bool, err error) {
-			innerErr := c.Patch(ctx, mutatingWebhook, client.StrategicMergeFrom(oldMutatingWebhook))
-			if innerErr != nil {
-				log.Error(innerErr)
-				return false, nil
-			}
-			return true, nil
-		})
-
-		if err != nil {
-			return err
+	mutatPatchBytes, err := json.Marshal(mutatingCfg)
+	if err != nil {
+		return err
+	}
+	err = wait.ExponentialBackoff(utils.DefaultPatchBackoff, func() (done bool, err error) {
+		_, innerErr := cs.AdmissionregistrationV1().MutatingWebhookConfigurations().Patch(context.Background(), mutatingWebhook.Name, types.StrategicMergePatchType, mutatPatchBytes, metav1.PatchOptions{})
+		if innerErr != nil {
+			return false, err
 		}
-		log.Info("update MutatingWebhook ca bundle success")
+		return true, nil
+	})
+	if err != nil {
+		return err
 	}
 
-	validateWebhook := &admissionregistrationv1.ValidatingWebhookConfiguration{}
-	err = c.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, validateWebhook)
+	validateWebhook, err := cs.AdmissionregistrationV1().ValidatingWebhookConfigurations().Get(context.Background(), name, metav1.GetOptions{})
 	if err != nil {
 		return err
 	}
 	if len(validateWebhook.Webhooks) == 0 {
 		return fmt.Errorf("no webhook config found")
 	}
-	changed = false
-	oldValidateWebhook := validateWebhook.DeepCopy()
+	validateCfg := validateWebhook.DeepCopy()
 	for i, hook := range validateWebhook.Webhooks {
 		if len(hook.ClientConfig.CABundle) != 0 {
 			continue
 		}
 		// patch ca
-		validateWebhook.Webhooks[i].ClientConfig.CABundle = caCertBytes
-		changed = true
+		validateCfg.Webhooks[i].ClientConfig.CABundle = caCertBytes
 	}
-	if changed {
-		err = wait.ExponentialBackoffWithContext(ctx, utils.DefaultPatchBackoff, func(ctx context.Context) (done bool, err error) {
-			innerErr := c.Patch(ctx, validateWebhook, client.StrategicMergeFrom(oldValidateWebhook))
-			if innerErr != nil {
-				log.Error(innerErr)
-				return false, nil
-			}
-			return true, nil
-		})
-		if err != nil {
-			return err
+	validatePatchBytes, err := json.Marshal(validateCfg)
+	if err != nil {
+		return err
+	}
+	err = wait.ExponentialBackoff(utils.DefaultPatchBackoff, func() (done bool, err error) {
+		_, innerErr := cs.AdmissionregistrationV1().ValidatingWebhookConfigurations().Patch(context.Background(), validateWebhook.Name, types.StrategicMergePatchType, validatePatchBytes, metav1.PatchOptions{})
+		if innerErr != nil {
+			return false, err
 		}
-		log.Info("update ValidatingWebhook ca bundle success")
-	}
+		return true, nil
+	})
 
-	return nil
+	return err
 }
 
 func GenerateCerts(serviceNamespace, serviceName, clusterDomain string) (*corev1.Secret, error) {

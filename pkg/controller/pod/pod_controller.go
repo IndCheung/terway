@@ -1,5 +1,5 @@
 /*
-Copyright 2021-2022 Terway Authors.
+Copyright 2021 Terway Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,18 +22,14 @@ import (
 	"strings"
 	"time"
 
-	"k8s.io/apimachinery/pkg/util/wait"
-
 	aliyunClient "github.com/AliyunContainerService/terway/pkg/aliyun/client"
 	"github.com/AliyunContainerService/terway/pkg/apis/network.alibabacloud.com/v1beta1"
-	"github.com/AliyunContainerService/terway/pkg/backoff"
 	register "github.com/AliyunContainerService/terway/pkg/controller"
 	"github.com/AliyunContainerService/terway/pkg/controller/common"
+	"github.com/AliyunContainerService/terway/pkg/controller/vswitch"
 	"github.com/AliyunContainerService/terway/pkg/utils"
-	"github.com/AliyunContainerService/terway/pkg/vswitch"
 	"github.com/AliyunContainerService/terway/types"
 	"github.com/AliyunContainerService/terway/types/controlplane"
-	"github.com/AliyunContainerService/terway/types/daemon"
 
 	"golang.org/x/sync/errgroup"
 	corev1 "k8s.io/api/core/v1"
@@ -53,14 +49,12 @@ import (
 )
 
 const controllerName = "pod"
-const defaultInterface = "eth0"
 
 func init() {
-	register.Add(controllerName, func(mgr manager.Manager, ctrlCtx *register.ControllerCtx) error {
-		crdMode := controlplane.GetConfig().IPAMType == types.IPAMTypeCRD
-
+	register.Add(controllerName, func(mgr manager.Manager, aliyunClient register.Interface, swPool *vswitch.SwitchPool) error {
+		r := NewReconcilePod(mgr, aliyunClient, swPool)
 		c, err := controller.NewUnmanaged(controllerName, mgr, controller.Options{
-			Reconciler:              NewReconcilePod(mgr, ctrlCtx.AliyunClient, ctrlCtx.VSwitchPool, crdMode),
+			Reconciler:              r,
 			MaxConcurrentReconciles: controlplane.GetConfig().PodMaxConcurrent,
 		})
 		if err != nil {
@@ -69,6 +63,7 @@ func init() {
 
 		w := &Wrapper{
 			ctrl: c,
+			r:    r,
 		}
 		err = mgr.Add(w)
 		if err != nil {
@@ -76,12 +71,14 @@ func init() {
 		}
 
 		return c.Watch(
-			source.Kind(mgr.GetCache(), &corev1.Pod{}),
+			&source.Kind{
+				Type: &corev1.Pod{},
+			},
 			&handler.EnqueueRequestForObject{},
 			&predicate.ResourceVersionChangedPredicate{},
-			&predicateForPodEvent{crdMode: crdMode},
+			&predicateForPodEvent{},
 		)
-	}, true)
+	})
 }
 
 // ReconcilePod implements reconcile.Reconciler
@@ -97,12 +94,11 @@ type ReconcilePod struct {
 
 	//record event recorder
 	record record.EventRecorder
-
-	crdMode bool
 }
 
 type Wrapper struct {
 	ctrl controller.Controller
+	r    *ReconcilePod
 }
 
 // Start the controller
@@ -122,14 +118,13 @@ func (w *Wrapper) NeedLeaderElection() bool {
 }
 
 // NewReconcilePod watch pod lifecycle events and sync to podENI resource
-func NewReconcilePod(mgr manager.Manager, aliyunClient register.Interface, swPool *vswitch.SwitchPool, crdMode bool) *ReconcilePod {
+func NewReconcilePod(mgr manager.Manager, aliyunClient register.Interface, swPool *vswitch.SwitchPool) *ReconcilePod {
 	r := &ReconcilePod{
-		client:  mgr.GetClient(),
-		scheme:  mgr.GetScheme(),
-		record:  mgr.GetEventRecorderFor("TerwayPodController"),
-		aliyun:  aliyunClient,
-		swPool:  swPool,
-		crdMode: crdMode,
+		client: mgr.GetClient(),
+		scheme: mgr.GetScheme(),
+		record: mgr.GetEventRecorderFor("Pod"),
+		aliyun: aliyunClient,
+		swPool: swPool,
 	}
 	return r
 }
@@ -142,32 +137,26 @@ func NewReconcilePod(mgr manager.Manager, aliyunClient register.Interface, swPoo
 func (m *ReconcilePod) Reconcile(ctx context.Context, request reconcile.Request) (reconcile.Result, error) {
 	l := log.FromContext(ctx)
 	l.V(5).Info("Reconcile")
-	start := time.Now()
+
 	pod := &corev1.Pod{}
 	err := m.client.Get(ctx, request.NamespacedName, pod)
 	if err != nil {
 		if k8sErr.IsNotFound(err) {
-			result, err := m.podDelete(ctx, request.NamespacedName)
-			m.recordPodDelete(pod, start, err)
-			return result, err
+			return m.podDelete(ctx, request.NamespacedName)
 		}
 		return reconcile.Result{}, err
 	}
-
-	if utils.PodSandboxExited(pod) {
-		result, err := m.podDelete(ctx, request.NamespacedName)
-		m.recordPodDelete(pod, start, err)
-		return result, err
+	if utils.IsJobPod(pod) {
+		if utils.PodSandboxExited(pod) {
+			return m.podDelete(ctx, request.NamespacedName)
+		}
 	}
-
 	// for pod is deleting we will wait it terminated
 	if !pod.DeletionTimestamp.IsZero() {
 		return reconcile.Result{RequeueAfter: 2 * time.Second}, nil
 	}
 
-	result, err := m.podCreate(ctx, pod)
-	m.recordPodCreate(pod, start, err)
-	return result, err
+	return m.podCreate(ctx, pod)
 }
 
 // NeedLeaderElection need election
@@ -179,23 +168,7 @@ func (m *ReconcilePod) NeedLeaderElection() bool {
 func (m *ReconcilePod) podCreate(ctx context.Context, pod *corev1.Pod) (reconcile.Result, error) {
 	l := log.FromContext(ctx)
 
-	if pod.Spec.NodeName == "" {
-		return reconcile.Result{}, nil
-	}
-	// ignore all create for eci pod
-	node, err := m.getNode(ctx, pod.Spec.NodeName)
-	if err != nil {
-		return reconcile.Result{}, fmt.Errorf("error get node %s, %w", node.Name, err)
-	}
-
-	if types.IgnoredByTerway(node.Labels) {
-		return reconcile.Result{}, nil
-	}
-
-	if utils.ISVKNode(node) {
-		return reconcile.Result{}, nil
-	}
-
+	var err error
 	// 1. check podENI is existed
 	prePodENI := &v1beta1.PodENI{}
 	err = m.client.Get(ctx, k8stypes.NamespacedName{
@@ -203,7 +176,6 @@ func (m *ReconcilePod) podCreate(ctx context.Context, pod *corev1.Pod) (reconcil
 		Name:      pod.Name,
 	}, prePodENI)
 	if err == nil {
-		l.V(5).Info("podENI", "phase", prePodENI.Status.Phase)
 		// for podENI is deleting , wait it down
 		if !prePodENI.DeletionTimestamp.IsZero() {
 			return reconcile.Result{Requeue: true}, nil
@@ -212,30 +184,12 @@ func (m *ReconcilePod) podCreate(ctx context.Context, pod *corev1.Pod) (reconcil
 		case v1beta1.ENIPhaseUnbind:
 			return m.reConfig(ctx, pod, prePodENI)
 		case v1beta1.ENIPhaseBind:
-			// check pod uid
-			if prePodENI.Annotations[types.PodUID] == string(pod.UID) {
-				return reconcile.Result{}, nil
-			}
-			// if using fixed ip , unbind it
-			if prePodENI.Spec.HaveFixedIP() {
-				prePodENICopy := prePodENI.DeepCopy()
-				prePodENICopy.Status.Phase = v1beta1.ENIPhaseDetaching
-				_, err = common.UpdatePodENIStatus(ctx, m.client, prePodENICopy)
-				return reconcile.Result{RequeueAfter: 5 * time.Second}, err
-			}
-			return reconcile.Result{RequeueAfter: 5 * time.Second}, m.client.Delete(ctx, prePodENI)
-		case v1beta1.ENIPhaseBinding, v1beta1.ENIPhaseDetaching:
-			return reconcile.Result{RequeueAfter: time.Second}, nil
+			return reconcile.Result{}, nil
 		}
 		return reconcile.Result{Requeue: true}, nil
 	}
 
 	// 2. cr is not found , so we will create new
-	nodeInfo, allocType, allocs, err := m.parse(ctx, pod, node)
-	if err != nil {
-		return reconcile.Result{}, fmt.Errorf("error parse config, %w", err)
-	}
-
 	l.Info("creating eni")
 
 	podENI := &v1beta1.PodENI{
@@ -248,12 +202,13 @@ func (m *ReconcilePod) podCreate(ctx context.Context, pod *corev1.Pod) (reconcil
 			Annotations: map[string]string{
 				types.PodUID: string(pod.UID),
 			},
-			Labels: map[string]string{
-				types.ENIRelatedNodeName: nodeInfo.NodeName,
-			},
 		},
 	}
 
+	nodeInfo, allocType, allocs, err := m.parse(ctx, pod)
+	if err != nil {
+		return reconcile.Result{}, fmt.Errorf("error parse config, %w", err)
+	}
 	defer func() {
 		if err != nil {
 			l.Error(err, "error ,will roll back all created eni")
@@ -264,7 +219,7 @@ func (m *ReconcilePod) podCreate(ctx context.Context, pod *corev1.Pod) (reconcil
 		}
 	}()
 
-	podENI.Spec.Zone = nodeInfo.ZoneID
+	podENI.Spec.Zone = nodeInfo.Zone
 
 	// 2.2 create eni
 	err = m.createENI(ctx, &allocs, allocType, pod, podENI)
@@ -278,36 +233,7 @@ func (m *ReconcilePod) podCreate(ctx context.Context, pod *corev1.Pod) (reconcil
 		return reconcile.Result{}, fmt.Errorf("error create cr, %s", err)
 	}
 
-	// 2.4 wait cr created
-	_ = wait.PollUntilContextTimeout(ctx, 500*time.Millisecond, 2*time.Second, true, func(ctx context.Context) (bool, error) {
-		podENI := &v1beta1.PodENI{}
-		err := m.client.Get(ctx, k8stypes.NamespacedName{
-			Namespace: pod.Namespace,
-			Name:      pod.Name,
-		}, podENI)
-		if err != nil {
-			return false, nil
-		}
-		return true, nil
-	})
-
 	return reconcile.Result{}, nil
-}
-
-func (m *ReconcilePod) recordPodCreate(pod *corev1.Pod, startTime time.Time, err error) {
-	if err == nil || pod == nil {
-		return
-	}
-	m.record.Eventf(pod, corev1.EventTypeWarning,
-		"CniPodCreateError", fmt.Sprintf("PodCreateError: %s, elapsedTime: %s", err, time.Since(startTime)))
-}
-
-func (m *ReconcilePod) recordPodDelete(pod *corev1.Pod, startTime time.Time, err error) {
-	if err == nil || pod == nil {
-		return
-	}
-	m.record.Eventf(pod, corev1.EventTypeWarning,
-		"CniPodDeleteError", fmt.Sprintf("CniPodDeleteError: %s, elapsedTime: %s", err, time.Since(startTime)))
 }
 
 // podDelete is proceed after pod is deleted
@@ -322,7 +248,7 @@ func (m *ReconcilePod) podDelete(ctx context.Context, namespacedName client.Obje
 		}
 	}
 	// already deleting
-	if prePodENI.Status.Phase == v1beta1.ENIPhaseDeleting || !prePodENI.DeletionTimestamp.IsZero() {
+	if prePodENI.Status.Phase == v1beta1.ENIPhaseDeleting {
 		return reconcile.Result{}, nil
 	}
 
@@ -356,7 +282,12 @@ func (m *ReconcilePod) deleteAllENI(ctx context.Context, podENI *v1beta1.PodENI)
 		if alloc.ENI.ID == "" {
 			continue
 		}
-		err := m.aliyun.DeleteNetworkInterface(common.WithCtx(ctx, &alloc), alloc.ENI.ID)
+		ctx := common.WithCtx(ctx, &alloc)
+		realClient, _, err := common.Became(ctx, m.aliyun)
+		if err != nil {
+			return err
+		}
+		err = realClient.DeleteNetworkInterface(ctx, alloc.ENI.ID)
 		if err != nil {
 			return err
 		}
@@ -373,7 +304,11 @@ func (m *ReconcilePod) getNode(ctx context.Context, name string) (*corev1.Node, 
 	return node, err
 }
 
-func (m *ReconcilePod) parse(ctx context.Context, pod *corev1.Pod, node *corev1.Node) (*common.NodeInfo, *v1beta1.AllocationType, []*v1beta1.Allocation, error) {
+func (m *ReconcilePod) parse(ctx context.Context, pod *corev1.Pod) (*common.NodeInfo, *v1beta1.AllocationType, []*v1beta1.Allocation, error) {
+	node, err := m.getNode(ctx, pod.Spec.NodeName)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("error get node %s, %w", node.Name, err)
+	}
 	nodeInfo, err := common.NewNodeInfo(node)
 	if err != nil {
 		return nil, nil, nil, err
@@ -387,7 +322,7 @@ func (m *ReconcilePod) parse(ctx context.Context, pod *corev1.Pod, node *corev1.
 		return nil, nil, nil, fmt.Errorf("error parse pod annotation, %w", err)
 	}
 
-	allocs, err := m.ParsePodNetworksFromAnnotation(ctx, nodeInfo.ZoneID, anno)
+	allocs, err := m.ParsePodNetworksFromAnnotation(ctx, nodeInfo.Zone, anno)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("error parse pod annotation, %w", err)
 	}
@@ -397,33 +332,6 @@ func (m *ReconcilePod) parse(ctx context.Context, pod *corev1.Pod, node *corev1.
 
 		podNetwokingName := pod.Annotations[types.PodNetworking]
 		if podNetwokingName == "" {
-			if m.crdMode {
-				// fall back policy , if webhook not enabled
-
-				cfg, err := daemon.ConfigFromConfigMap(ctx, m.client, "")
-				if err != nil {
-					return nil, nil, nil, err
-				}
-
-				vsw, err := m.swPool.GetOne(ctx, m.aliyun, nodeInfo.ZoneID, cfg.GetVSwitchIDs())
-				if err != nil {
-					return nil, nil, nil, fmt.Errorf("can not found available vSwitch for zone %s, %w", nodeInfo.ZoneID, err)
-				}
-				allocs = append(allocs, &v1beta1.Allocation{
-					ENI: v1beta1.ENI{
-						SecurityGroupIDs: cfg.GetSecurityGroups(),
-						VSwitchID:        vsw.ID,
-					},
-					IPv4CIDR: vsw.IPv4CIDR,
-					IPv6CIDR: vsw.IPv6CIDR,
-				})
-				allocType, err = controlplane.ParsePodIPTypeFromAnnotation(pod)
-				if err != nil {
-					return nil, nil, nil, err
-				}
-
-				return nodeInfo, allocType, allocs, nil
-			}
 			return nil, nil, nil, fmt.Errorf("podNetworking is empty")
 		}
 		var podNetworking v1beta1.PodNetworking
@@ -435,9 +343,9 @@ func (m *ReconcilePod) parse(ctx context.Context, pod *corev1.Pod, node *corev1.
 			return nil, nil, nil, fmt.Errorf("error get podNetworking %s, %w", podNetwokingName, err)
 		}
 		var vsw *vswitch.Switch
-		vsw, err = m.swPool.GetOne(ctx, m.aliyun, nodeInfo.ZoneID, podNetworking.Spec.VSwitchOptions)
+		vsw, err = m.swPool.GetOne(ctx, m.aliyun, nodeInfo.Zone, podNetworking.Spec.VSwitchOptions, false)
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("can not found available vSwitch for zone %s, %w", nodeInfo.ZoneID, err)
+			return nil, nil, nil, fmt.Errorf("can not found available vSwitch for zone %s, %w", nodeInfo.Zone, err)
 		}
 
 		allocs = append(allocs, &v1beta1.Allocation{
@@ -475,22 +383,6 @@ func (m *ReconcilePod) reConfig(ctx context.Context, pod *corev1.Pod, prePodENI 
 
 	update := prePodENI.DeepCopy()
 
-	if prePodENI.Labels[types.ENIRelatedNodeName] != "" {
-		// ignore all create for eci pod
-		node, err := m.getNode(ctx, pod.Spec.NodeName)
-		if err != nil {
-			return reconcile.Result{}, fmt.Errorf("error get node %s, %w", node.Name, err)
-		}
-		if utils.ISVKNode(node) {
-			return reconcile.Result{}, nil
-		}
-		if prePodENI.Labels[types.ENIRelatedNodeName] != node.Name {
-			update.Labels[types.ENIRelatedNodeName] = node.Name
-			err = m.client.Patch(ctx, update, client.MergeFrom(prePodENI))
-			return reconcile.Result{Requeue: true}, err
-		}
-	}
-
 	if prePodENI.Annotations[types.PodUID] == string(pod.UID) {
 		update.Status.Phase = v1beta1.ENIPhaseBinding
 		_, err := common.UpdatePodENIStatus(ctx, m.client, update)
@@ -502,15 +394,10 @@ func (m *ReconcilePod) reConfig(ctx context.Context, pod *corev1.Pod, prePodENI 
 	}
 	update.Annotations[types.PodUID] = string(pod.UID)
 
-	if pod.Annotations[types.PodNetworking] != "" {
-		l.V(5).Info("using podNetworking will not re-config", types.PodNetworking, pod.Annotations[types.PodNetworking])
+	if prePodENI.Annotations[types.PodNetworking] != "" {
+		l.V(5).Info("using podNetworking will not re-config", types.PodNetworking, prePodENI.Annotations[types.PodNetworking])
 		_, err := common.UpdatePodENI(ctx, m.client, update)
-		return reconcile.Result{Requeue: true}, err
-	}
-
-	if _, ok := prePodENI.Annotations[types.ENIAllocFromPool]; ok {
-		_, err := common.UpdatePodENI(ctx, m.client, update)
-		return reconcile.Result{Requeue: true}, err
+		return reconcile.Result{}, err
 	}
 
 	// TODO check and update podENI spec
@@ -523,7 +410,7 @@ func (m *ReconcilePod) reConfig(ctx context.Context, pod *corev1.Pod, prePodENI 
 	for i, n := range anno.PodNetworks {
 		name := n.Interface
 		if name == "" {
-			name = defaultInterface
+			name = "eth0"
 		}
 		targets[name] = i
 	}
@@ -533,7 +420,7 @@ func (m *ReconcilePod) reConfig(ctx context.Context, pod *corev1.Pod, prePodENI 
 		alloc := update.Spec.Allocations[i]
 		name := alloc.Interface
 		if name == "" {
-			name = defaultInterface
+			name = "eth0"
 		}
 
 		if _, ok := targets[name]; ok {
@@ -544,7 +431,13 @@ func (m *ReconcilePod) reConfig(ctx context.Context, pod *corev1.Pod, prePodENI 
 		l.Info("changed remove eni", "if", name, "eni", alloc.ENI.ID)
 
 		if alloc.ENI.ID != "" {
-			err = m.aliyun.DeleteNetworkInterface(common.WithCtx(context.Background(), &alloc), alloc.ENI.ID)
+			ctx := common.WithCtx(context.Background(), &alloc)
+			realClient, _, err := common.Became(ctx, m.aliyun)
+			if err != nil {
+				m.record.Eventf(prePodENI, corev1.EventTypeWarning, types.EventDeleteENIFailed, err.Error())
+				return reconcile.Result{}, err
+			}
+			err = realClient.DeleteNetworkInterface(context.Background(), alloc.ENI.ID)
 			if err != nil {
 				m.record.Eventf(prePodENI, corev1.EventTypeWarning, types.EventDeleteENIFailed, err.Error())
 				return reconcile.Result{}, err
@@ -572,7 +465,7 @@ func (m *ReconcilePod) reConfig(ctx context.Context, pod *corev1.Pod, prePodENI 
 		return reconcile.Result{}, err
 	}
 
-	allocs, err := m.ParsePodNetworksFromAnnotation(ctx, nodeInfo.ZoneID, newAnno)
+	allocs, err := m.ParsePodNetworksFromAnnotation(ctx, nodeInfo.Zone, newAnno)
 	if err != nil {
 		return reconcile.Result{}, err
 	}
@@ -629,52 +522,38 @@ func (m *ReconcilePod) createENI(ctx context.Context, allocs *[]*v1beta1.Allocat
 		g.Go(func() error {
 			alloc := (*allocs)[ii]
 			ctx := common.WithCtx(ctx, alloc)
+			realClient, _, err := common.Became(ctx, m.aliyun)
+			if err != nil {
+				return fmt.Errorf("get client failed, %w", err)
+			}
 
-			deleteENIOnECSRelease := true
-			if allocType.Type == v1beta1.IPAllocTypeFixed {
-				deleteENIOnECSRelease = false
-			}
-			bo := backoff.Backoff(backoff.ENICreate)
-			option := &aliyunClient.CreateNetworkInterfaceOptions{
-				NetworkInterfaceOptions: &aliyunClient.NetworkInterfaceOptions{
-					Trunk:            false,
-					ERDMA:            false,
-					VSwitchID:        alloc.ENI.VSwitchID,
-					SecurityGroupIDs: alloc.ENI.SecurityGroupIDs,
-					ResourceGroupID:  alloc.ENI.ResourceGroupID,
-					IPCount:          1,
-					IPv6Count:        ipv6Count,
-					Tags: map[string]string{
-						types.TagKeyClusterID:               clusterID,
-						types.NetworkInterfaceTagCreatorKey: types.TagTerwayController,
-					},
-					DeleteENIOnECSRelease: &deleteENIOnECSRelease,
-				},
-				Backoff: &bo,
-			}
-			eni, err := m.aliyun.CreateNetworkInterface(ctx, option)
+			eni, err := realClient.CreateNetworkInterface(ctx, aliyunClient.ENITypeSecondary, alloc.ENI.VSwitchID, alloc.ENI.SecurityGroupIDs, 1, ipv6Count, map[string]string{
+				types.TagKeyClusterID:               clusterID,
+				types.NetworkInterfaceTagCreatorKey: types.TagTerwayController,
+				types.TagKubernetesPodName:          utils.TrimStr(pod.Name, 120),
+				types.TagKubernetesPodNamespace:     utils.TrimStr(pod.Namespace, 120),
+			})
 			if err != nil {
 				return fmt.Errorf("create eni with openAPI err, %w", err)
 			}
 
 			v6 := ""
-			if len(eni.IPv6Set) > 0 {
-				v6 = eni.IPv6Set[0].Ipv6Address
+			if len(eni.Ipv6Sets.Ipv6Set) > 0 {
+				v6 = eni.Ipv6Sets.Ipv6Set[0].Ipv6Address
 			}
 			alloc.ENI = v1beta1.ENI{
-				ID:               eni.NetworkInterfaceID,
+				ID:               eni.NetworkInterfaceId,
 				MAC:              eni.MacAddress,
-				Zone:             eni.ZoneID,
-				VSwitchID:        eni.VSwitchID,
-				SecurityGroupIDs: eni.SecurityGroupIDs,
-				ResourceGroupID:  eni.ResourceGroupID,
+				Zone:             eni.ZoneId,
+				VSwitchID:        eni.VSwitchId,
+				SecurityGroupIDs: eni.SecurityGroupIds.SecurityGroupId,
 			}
-			alloc.IPv4 = eni.PrivateIPAddress
+			alloc.IPv4 = eni.PrivateIpAddress
 			alloc.IPv6 = v6
 			alloc.AllocationType = *allocType
 
 			ch <- alloc
-			return m.PostENICreate(ctx, alloc)
+			return m.PostENICreate(ctx, realClient, alloc)
 		})
 	}
 	err = g.Wait()

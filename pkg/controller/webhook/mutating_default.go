@@ -1,4 +1,5 @@
 //go:build default_build
+// +build default_build
 
 /*
 Copyright 2021 Terway Authors.
@@ -20,14 +21,8 @@ package webhook
 
 import (
 	"github.com/AliyunContainerService/terway/types/controlplane"
-
-	corev1 "k8s.io/api/core/v1"
 )
 
 func needPreviousZoneForAnnotation(zone string, _ controlplane.PodNetworks) bool {
 	return zone != ""
-}
-
-func selectContainer(pod *corev1.Pod) int {
-	return 0
 }

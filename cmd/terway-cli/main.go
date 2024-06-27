@@ -3,15 +3,13 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"net"
-	"os"
 	"time"
 
+	"github.com/AliyunContainerService/terway/rpc"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-
-	"github.com/AliyunContainerService/terway/rpc"
 )
 
 const (
@@ -34,7 +32,7 @@ var (
 		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
 			// create connection and grpc client
 			ctx, contextCancel = context.WithTimeout(context.Background(), connTimeout)
-			conn, err := grpc.DialContext(ctx, defaultSocketPath, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithContextDialer(
+			conn, err := grpc.DialContext(ctx, defaultSocketPath, grpc.WithInsecure(), grpc.WithContextDialer(
 				func(ctx context.Context, s string) (net.Conn, error) {
 					unixAddr, err := net.ResolveUnixAddr("unix", defaultSocketPath)
 					if err != nil {
@@ -94,12 +92,11 @@ var (
 )
 
 func init() {
-	rootCmd.AddCommand(listCmd, showCmd, mappingCmd, executeCmd, metadataCmd, cniCmd)
+	rootCmd.AddCommand(listCmd, showCmd, mappingCmd, executeCmd, metadataCmd)
 }
 
 func main() {
 	if err := rootCmd.Execute(); err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "%v\n", err)
-		os.Exit(1)
+		log.Fatalf("terway-cli error: %s", err)
 	}
 }

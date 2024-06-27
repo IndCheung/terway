@@ -153,13 +153,6 @@ func (d *Vlan) Setup(cfg *types.SetupConfig, netNS ns.NetNS) error {
 		return fmt.Errorf("error get link by index %d, %w", cfg.ENIIndex, err)
 	}
 
-	if cfg.EnableNetworkPriority {
-		err = utils.SetEgressPriority(master, cfg.NetworkPriority, cfg.ContainerIPNet)
-		if err != nil {
-			return err
-		}
-	}
-
 	eniCfg := generateENICfgForVlan(cfg)
 	err = nic.Setup(master, eniCfg)
 	if err != nil {

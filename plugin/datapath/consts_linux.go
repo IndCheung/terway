@@ -2,13 +2,11 @@ package datapath
 
 import (
 	"net"
-
-	"github.com/vishvananda/netlink"
-
-	"github.com/AliyunContainerService/terway/types"
 )
 
 const (
+	// mainRouteTable the system "main" route table id
+	mainRouteTable        = 254
 	toContainerPriority   = 512
 	fromContainerPriority = 2048
 )
@@ -28,10 +26,3 @@ var (
 		Mask: net.CIDRMask(128, 128),
 	}
 )
-
-var PrioMap = map[string]uint32{
-	string(types.NetworkPrioGuaranteed): netlink.MakeHandle(1, 1), // band 0
-	string(types.NetworkPrioBurstable):  netlink.MakeHandle(1, 2), // band 1
-	string(types.NetworkPrioBestEffort): netlink.MakeHandle(1, 3), // band 2
-	"":                                  netlink.MakeHandle(1, 2),
-}

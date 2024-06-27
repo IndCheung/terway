@@ -8,9 +8,7 @@ import (
 
 	"github.com/AliyunContainerService/terway/pkg/aliyun/metadata"
 	"github.com/AliyunContainerService/terway/rpc"
-
 	"github.com/pterm/pterm"
-	"github.com/pterm/pterm/putils"
 	"github.com/spf13/cobra"
 )
 
@@ -99,6 +97,23 @@ func runShow(cmd *cobra.Command, args []string) error {
 	return err
 }
 
+const (
+	mappingTableHeaderStatus            = "Status"
+	mappingTableHeaderPodName           = "Pod Name"
+	mappingTableHeaderResourceID        = "Res ID"
+	mappingTableHeaderFactoryResourceID = "Factory Res ID"
+
+	mappingStringErrorExists = "error exists in mapping"
+)
+
+var (
+	mappingStatus = map[rpc.ResourceMappingType]string{
+		rpc.ResourceMappingType_MappingTypeNormal: "Normal",
+		rpc.ResourceMappingType_MappingTypeIdle:   "Idle",
+		rpc.ResourceMappingType_MappingTypeError:  "ERROR",
+	}
+)
+
 func runMapping(cmd *cobra.Command, args []string) error {
 	placeholder := &rpc.Placeholder{}
 	result, err := client.GetResourceMapping(ctx, placeholder)
@@ -106,51 +121,40 @@ func runMapping(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	//
-	for i, r := range result.Info {
-		items := []pterm.BulletListItem{
-			{
-				Level:       0,
-				Text:        fmt.Sprintf("slot %d", i),
-				BulletStyle: pterm.NewStyle(pterm.FgRed),
-			},
-			{
-				Level:  1,
-				Text:   r.NetworkInterfaceID,
-				Bullet: "-",
-			},
-			{
-				Level:  1,
-				Text:   r.MAC,
-				Bullet: "-",
-			},
-			{
-				Level:  1,
-				Text:   r.Status,
-				Bullet: "-",
-			},
-			{
-				Level:  1,
-				Text:   fmt.Sprintf("Type %s", r.Type),
-				Bullet: "-",
-			},
-			{
-				Level:  1,
-				Text:   fmt.Sprintf("InhibitExpireAt %s", r.AllocInhibitExpireAt),
-				Bullet: "-",
-			},
+	tableData := pterm.TableData{
+		{
+			mappingTableHeaderStatus,
+			mappingTableHeaderPodName,
+			mappingTableHeaderResourceID,
+			mappingTableHeaderFactoryResourceID,
+		},
+	}
+
+	for _, v := range result.Info {
+		clr := pterm.FgDefault
+		switch v.Type {
+		case rpc.ResourceMappingType_MappingTypeNormal:
+			// Idle
+			if v.PodName == "" {
+				v.Type = rpc.ResourceMappingType_MappingTypeIdle
+				clr = pterm.FgLightCyan
+			}
+		case rpc.ResourceMappingType_MappingTypeError:
+			clr = pterm.FgLightRed
+			err = fmt.Errorf(mappingStringErrorExists)
 		}
 
-		for _, v := range r.Info {
-			items = append(items, pterm.BulletListItem{
-				Level: 2,
-				Text:  v,
-			})
+		row := []string{
+			clr.Sprint(mappingStatus[v.Type]),
+			clr.Sprint(v.PodName),
+			clr.Sprint(v.ResourceName),
+			clr.Sprint(v.FactoryResourceName),
 		}
+		tableData = append(tableData, row)
+	}
 
-		if err := pterm.DefaultBulletList.WithItems(items).Render(); err != nil {
-			return err
-		}
+	if err := pterm.DefaultTable.WithHasHeader().WithData(tableData).Render(); err != nil {
+		return err
 	}
 
 	return err
@@ -324,7 +328,7 @@ func runMetadata(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	tree := putils.TreeFromLeveledList(leveledList)
+	tree := pterm.NewTreeFromLeveledList(leveledList)
 	return pterm.DefaultTree.
 		WithTextStyle(&pterm.ThemeDefault.BarLabelStyle).
 		WithRoot(tree).

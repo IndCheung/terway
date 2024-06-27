@@ -23,12 +23,15 @@ import (
 	aliyunClient "github.com/AliyunContainerService/terway/pkg/aliyun/client"
 	"github.com/AliyunContainerService/terway/pkg/apis/network.alibabacloud.com/v1beta1"
 	register "github.com/AliyunContainerService/terway/pkg/controller"
-	"github.com/AliyunContainerService/terway/pkg/vswitch"
+	"github.com/AliyunContainerService/terway/pkg/controller/vswitch"
+	"github.com/AliyunContainerService/terway/pkg/utils"
 	"github.com/AliyunContainerService/terway/types"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -43,9 +46,9 @@ import (
 const controllerName = "pod-networking"
 
 func init() {
-	register.Add(controllerName, func(mgr manager.Manager, ctrlCtx *register.ControllerCtx) error {
+	register.Add(controllerName, func(mgr manager.Manager, aliyunClient register.Interface, swPool *vswitch.SwitchPool) error {
 		c, err := controller.New(controllerName, mgr, controller.Options{
-			Reconciler:              NewReconcilePodNetworking(mgr, ctrlCtx.AliyunClient, ctrlCtx.VSwitchPool),
+			Reconciler:              NewReconcilePodNetworking(mgr, aliyunClient, swPool),
 			MaxConcurrentReconciles: 1,
 		})
 		if err != nil {
@@ -53,12 +56,14 @@ func init() {
 		}
 
 		return c.Watch(
-			source.Kind(mgr.GetCache(), &v1beta1.PodNetworking{}),
+			&source.Kind{
+				Type: &v1beta1.PodNetworking{},
+			},
 			&handler.EnqueueRequestForObject{},
 			&predicate.ResourceVersionChangedPredicate{},
 			&predicateForPodnetwokringEvent{},
 		)
-	}, true)
+	})
 }
 
 // ReconcilePodNetworking implements reconcile.Reconciler
@@ -67,7 +72,8 @@ var _ reconcile.Reconciler = &ReconcilePodNetworking{}
 // ReconcilePodNetworking reconciles a AutoRepair object
 type ReconcilePodNetworking struct {
 	client       client.Client
-	aliyunClient aliyunClient.VPC
+	scheme       *runtime.Scheme
+	aliyunClient aliyunClient.VSwitch
 	swPool       *vswitch.SwitchPool
 
 	//record event recorder
@@ -75,9 +81,10 @@ type ReconcilePodNetworking struct {
 }
 
 // NewReconcilePodNetworking watch pod lifecycle events and sync to podENI resource
-func NewReconcilePodNetworking(mgr manager.Manager, aliyunClient aliyunClient.VPC, swPool *vswitch.SwitchPool) *ReconcilePodNetworking {
+func NewReconcilePodNetworking(mgr manager.Manager, aliyunClient aliyunClient.VSwitch, swPool *vswitch.SwitchPool) *ReconcilePodNetworking {
 	r := &ReconcilePodNetworking{
 		client:       mgr.GetClient(),
+		scheme:       mgr.GetScheme(),
 		record:       mgr.GetEventRecorderFor("PodNetworking"),
 		aliyunClient: aliyunClient,
 		swPool:       swPool,
@@ -98,10 +105,6 @@ func (m *ReconcilePodNetworking) Reconcile(ctx context.Context, request reconcil
 			return reconcile.Result{}, nil
 		}
 		return reconcile.Result{}, err
-	}
-
-	if !changed(old) && old.Status.Status == v1beta1.NetworkingStatusReady {
-		return reconcile.Result{}, nil
 	}
 
 	update := old.DeepCopy()
@@ -132,7 +135,7 @@ func (m *ReconcilePodNetworking) Reconcile(ctx context.Context, request reconcil
 		m.record.Eventf(update, corev1.EventTypeWarning, types.EventSyncPodNetworkingFailed, "Sync failed %s", err.Error())
 	}
 
-	err2 := m.client.Status().Update(ctx, update)
+	err2 := m.updateStatus(ctx, update, old)
 	if err != nil {
 		return reconcile.Result{RequeueAfter: 30 * time.Second}, nil
 	}
@@ -142,4 +145,20 @@ func (m *ReconcilePodNetworking) Reconcile(ctx context.Context, request reconcil
 // NeedLeaderElection need election
 func (m *ReconcilePodNetworking) NeedLeaderElection() bool {
 	return true
+}
+
+func (m *ReconcilePodNetworking) updateStatus(ctx context.Context, update, old *v1beta1.PodNetworking) error {
+	err := wait.ExponentialBackoff(utils.DefaultPatchBackoff, func() (done bool, err error) {
+		innerErr := m.client.Status().Patch(ctx, update, client.MergeFrom(old))
+		if innerErr != nil {
+			if errors.IsNotFound(innerErr) {
+				l := log.FromContext(ctx)
+				l.Info("podNetworking is not found")
+				return true, nil
+			}
+			return false, err
+		}
+		return true, nil
+	})
+	return err
 }

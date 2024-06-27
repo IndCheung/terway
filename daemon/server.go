@@ -1,9 +1,8 @@
 package daemon
 
 import (
-	"context"
 	"fmt"
-	"io"
+	"io/ioutil"
 	"net"
 	"net/http"
 	_ "net/http/pprof" // import pprof for diagnose
@@ -12,30 +11,18 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
 	"syscall"
-	"time"
 
-	"github.com/go-logr/logr"
-	logf "sigs.k8s.io/controller-runtime/pkg/log"
-
+	"github.com/AliyunContainerService/terway/pkg/logger"
 	"github.com/AliyunContainerService/terway/pkg/metric"
 	"github.com/AliyunContainerService/terway/pkg/tracing"
 	"github.com/AliyunContainerService/terway/pkg/utils"
 	"github.com/AliyunContainerService/terway/rpc"
 
-	"github.com/prometheus/client_golang/prometheus"
+	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	log "github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
-)
-
-const daemonRPCTimeout = 118 * time.Second
-
-const (
-	prevCNIConfFile   = "10-terway.conf"
-	cinConfFile       = "10-terway.conflist"
-	tmpCNIConfigPath  = "/etc/cni/net.d" // that is tmpfs
-	hostCNIConfigPath = "/host-etc-net.d"
 )
 
 // stackTriger print golang stack trace to log
@@ -55,8 +42,7 @@ func stackTriger() {
 				bufferLen *= 2
 			}
 			buf = buf[:stackSize]
-
-			os.Stdout.Write(buf)
+			log.Printf("dump stacks: %s\n", string(buf))
 		}
 	}(sigchain)
 
@@ -64,113 +50,101 @@ func stackTriger() {
 }
 
 // Run terway daemon
-func Run(ctx context.Context, socketFilePath, debugSocketListen, configFilePath, daemonMode string) error {
-	l, err := newUnixListener(socketFilePath)
+func Run(pidFilePath, socketFilePath, debugSocketListen, configFilePath, kubeconfig, master, daemonMode, logLevel string) error {
+	level, err := log.ParseLevel(logLevel)
+	if err != nil {
+		return errors.Wrapf(err, "error set log level: %s", logLevel)
+	}
+	logger.DefaultLogger.SetLevel(level)
+	if !utils.IsWindowsOS() {
+		// NB(thxCode): hcsshim lib introduces much noise.
+		log.SetLevel(level)
+	}
+	// Write the pidfile
+	if pidFilePath != "" {
+		if !filepath.IsAbs(pidFilePath) {
+			return fmt.Errorf("error writing pidfile %q: path not absolute", pidFilePath)
+		}
+
+		if _, err := os.Stat(filepath.Dir(pidFilePath)); err != nil && os.IsNotExist(err) {
+			if err = os.MkdirAll(filepath.Dir(pidFilePath), 0666); err != nil {
+				return fmt.Errorf("error create pid file: %+v", err)
+			}
+		}
+		if err := ioutil.WriteFile(pidFilePath, []byte(fmt.Sprintf("%d", os.Getpid())), 0644); err != nil {
+			return fmt.Errorf("error writing pidfile %q: %v", pidFilePath, err)
+		}
+	}
+
+	if err := os.MkdirAll(filepath.Dir(socketFilePath), 0700); err != nil {
+		return err
+	}
+
+	if err := syscall.Unlink(socketFilePath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	mask := syscallUmask(0777)
+	defer syscallUmask(mask)
+
+	l, err := net.Listen("unix", socketFilePath)
 	if err != nil {
 		return fmt.Errorf("error listen at %s: %v", socketFilePath, err)
 	}
 
-	svc, err := newNetworkService(ctx, configFilePath, daemonMode)
+	networkService, err := newNetworkService(configFilePath, kubeconfig, master, daemonMode)
 	if err != nil {
 		return err
 	}
 
-	grpcServer := grpc.NewServer(grpc.ChainUnaryInterceptor(
-		cniInterceptor,
-	))
-	rpc.RegisterTerwayBackendServer(grpcServer, svc)
+	grpcServer := grpc.NewServer()
+	rpc.RegisterTerwayBackendServer(grpcServer, networkService)
 	rpc.RegisterTerwayTracingServer(grpcServer, tracing.DefaultRPCServer())
 
 	stop := make(chan struct{})
 
+	go func() {
+		sigs := make(chan os.Signal, 1)
+		signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+		sig := <-sigs
+		log.Infof("got system signal: %v, exiting", sig)
+		stop <- struct{}{}
+	}()
+
 	stackTriger()
-	err = runDebugServer(ctx, &svc.wg, debugSocketListen)
+	err = runDebugServer(debugSocketListen)
 	if err != nil {
 		return err
 	}
 
 	go func() {
-		serviceLog.Info("start serving", "path", socketFilePath)
 		err = grpcServer.Serve(l)
 		if err != nil {
-			serviceLog.Error(err, "error serving grpc")
-			close(stop)
+			log.Errorf("error start grpc server: %v", err)
+			stop <- struct{}{}
 		}
 	}()
 
-	err = ensureCNIConfig()
-	if err != nil {
-		return err
-	}
-
-	select {
-	case <-ctx.Done():
-	case <-stop:
-	}
+	<-stop
 	grpcServer.Stop()
-
-	svc.wg.Wait()
-
 	return nil
 }
 
-func newUnixListener(addr string) (net.Listener, error) {
-	err := os.MkdirAll(filepath.Dir(addr), 0700)
-	if err != nil {
-		return nil, fmt.Errorf("error create socket dir: %s, %w", addr, err)
-	}
-
-	err = syscall.Unlink(addr)
-	if err != nil && !os.IsNotExist(err) {
-		return nil, fmt.Errorf("error unlink socket file: %s, %w", addr, err)
-	}
-	mask := syscallUmask(0777)
-	defer syscallUmask(mask)
-
-	l, err := net.Listen("unix", addr)
-	if err != nil {
-		return nil, err
-	}
-	err = os.Chmod(addr, 0600)
-	if err != nil {
-		return nil, err
-	}
-
-	return l, nil
-}
-
-func ensureCNIConfig() error {
-	src, err := os.Open(filepath.Join(tmpCNIConfigPath, cinConfFile))
-	if err != nil {
-		return err
-	}
-	defer src.Close()
-
-	dst, err := os.OpenFile(filepath.Join(hostCNIConfigPath, cinConfFile), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
-	if err != nil {
-		return err
-	}
-	defer dst.Close()
-
-	_, err = io.Copy(dst, src)
-	if err != nil {
-		return err
-	}
-
-	serviceLog.Info("write cni conf success")
-
-	_ = os.Remove(filepath.Join(hostCNIConfigPath, prevCNIConfFile))
-	return nil
-}
-
-func runDebugServer(ctx context.Context, wg *sync.WaitGroup, debugSocketListen string) error {
+func runDebugServer(debugSocketListen string) error {
 	var (
 		l   net.Listener
 		err error
 	)
 	if strings.HasPrefix(debugSocketListen, "unix://") {
 		debugSocketListen = strings.TrimPrefix(debugSocketListen, "unix://")
-		l, err = newUnixListener(debugSocketListen)
+		if err := os.MkdirAll(filepath.Dir(debugSocketListen), 0700); err != nil {
+			return err
+		}
+
+		if err := syscall.Unlink(debugSocketListen); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+
+		l, err = net.Listen("unix", debugSocketListen)
 		if err != nil {
 			return fmt.Errorf("error listen at %s: %v", debugSocketListen, err)
 		}
@@ -181,57 +155,15 @@ func runDebugServer(ctx context.Context, wg *sync.WaitGroup, debugSocketListen s
 		}
 	}
 
-	registerPrometheus()
+	metric.RegisterPrometheus()
 	http.DefaultServeMux.Handle("/metrics", promhttp.Handler())
 
 	go func() {
 		err := http.Serve(l, http.DefaultServeMux)
 		if err != nil {
-			serviceLog.Error(err, "error start debug server")
+			log.Errorf("error start debug server: %v", err)
 		}
 	}()
 
-	wg.Add(1)
-	go func() {
-		<-ctx.Done()
-		_ = l.Close()
-
-		wg.Done()
-	}()
-
 	return nil
-}
-
-// RegisterPrometheus register metrics to prometheus server
-func registerPrometheus() {
-	prometheus.MustRegister(metric.RPCLatency)
-	prometheus.MustRegister(metric.OpenAPILatency)
-	prometheus.MustRegister(metric.MetadataLatency)
-	// ResourcePool
-	prometheus.MustRegister(metric.ResourcePoolTotal)
-	prometheus.MustRegister(metric.ResourcePoolIdle)
-	prometheus.MustRegister(metric.ResourcePoolDisposed)
-	// ENIIP
-	prometheus.MustRegister(metric.ENIIPFactoryIPCount)
-	prometheus.MustRegister(metric.ENIIPFactoryENICount)
-	prometheus.MustRegister(metric.ENIIPFactoryIPAllocCount)
-}
-
-func cniInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
-	ctx, cancel := context.WithTimeout(ctx, daemonRPCTimeout)
-	defer cancel()
-
-	switch r := req.(type) {
-	case *rpc.AllocIPRequest:
-		l := logf.FromContext(ctx, "pod", utils.PodInfoKey(r.K8SPodNamespace, r.K8SPodName), "containerID", r.K8SPodInfraContainerId)
-		ctx = logr.NewContext(ctx, l)
-	case *rpc.ReleaseIPRequest:
-		l := logf.FromContext(ctx, "pod", utils.PodInfoKey(r.K8SPodNamespace, r.K8SPodName), "containerID", r.K8SPodInfraContainerId)
-		ctx = logr.NewContext(ctx, l)
-	case *rpc.GetInfoRequest:
-		l := logf.FromContext(ctx, "pod", utils.PodInfoKey(r.K8SPodNamespace, r.K8SPodName), "containerID", r.K8SPodInfraContainerId)
-		ctx = logr.NewContext(ctx, l)
-	default:
-	}
-	return handler(ctx, req)
 }

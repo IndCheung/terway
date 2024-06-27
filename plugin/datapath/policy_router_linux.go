@@ -11,7 +11,6 @@ import (
 
 	"github.com/containernetworking/plugins/pkg/ns"
 	"github.com/vishvananda/netlink"
-	"golang.org/x/sys/unix"
 )
 
 type PolicyRoute struct{}
@@ -193,10 +192,11 @@ func generateHostPeerCfgForPolicy(cfg *types.SetupConfig, link netlink.Link, tab
 		// 2. add host to container rule
 		toContainerRule := netlink.NewRule()
 		toContainerRule.Dst = v4
-		toContainerRule.Table = unix.RT_TABLE_MAIN
+		toContainerRule.Table = mainRouteTable
 		toContainerRule.Priority = toContainerPriority
 
 		fromContainerRule := netlink.NewRule()
+		fromContainerRule.IifName = link.Attrs().Name
 		fromContainerRule.Src = v4
 		fromContainerRule.Table = table
 		fromContainerRule.Priority = fromContainerPriority
@@ -221,10 +221,11 @@ func generateHostPeerCfgForPolicy(cfg *types.SetupConfig, link netlink.Link, tab
 		// 2. add host to container rule
 		toContainerRule := netlink.NewRule()
 		toContainerRule.Dst = v6
-		toContainerRule.Table = unix.RT_TABLE_MAIN
+		toContainerRule.Table = mainRouteTable
 		toContainerRule.Priority = toContainerPriority
 
 		fromContainerRule := netlink.NewRule()
+		fromContainerRule.IifName = link.Attrs().Name
 		fromContainerRule.Src = v6
 		fromContainerRule.Table = table
 		fromContainerRule.Priority = fromContainerPriority
@@ -252,29 +253,21 @@ func generateENICfgForPolicy(cfg *types.SetupConfig, link netlink.Link, table in
 
 	if cfg.ContainerIPNet.IPv4 != nil {
 		// add default route
-		gw := cfg.GatewayIP.IPv4
-		if cfg.StripVlan {
-			gw = cfg.ENIGatewayIP.IPv4
-		}
 		routes = append(routes, &netlink.Route{
 			LinkIndex: link.Attrs().Index,
 			Scope:     netlink.SCOPE_UNIVERSE,
 			Table:     table,
 			Dst:       defaultRoute,
-			Gw:        gw,
+			Gw:        cfg.GatewayIP.IPv4,
 			Flags:     int(netlink.FLAG_ONLINK),
 		})
 	}
 	if cfg.ContainerIPNet.IPv6 != nil {
-		gw := cfg.GatewayIP.IPv6
-		if cfg.StripVlan {
-			gw = cfg.ENIGatewayIP.IPv6
-		}
 		routes = append(routes, &netlink.Route{
 			LinkIndex: link.Attrs().Index,
 			Scope:     netlink.SCOPE_LINK,
 			Dst: &net.IPNet{
-				IP:   gw,
+				IP:   cfg.GatewayIP.IPv6,
 				Mask: net.CIDRMask(128, 128),
 			},
 		}, &netlink.Route{
@@ -282,7 +275,7 @@ func generateENICfgForPolicy(cfg *types.SetupConfig, link netlink.Link, table in
 			Scope:     netlink.SCOPE_UNIVERSE,
 			Table:     table,
 			Dst:       defaultRouteIPv6,
-			Gw:        gw,
+			Gw:        cfg.GatewayIP.IPv6,
 			Flags:     int(netlink.FLAG_ONLINK),
 		})
 
@@ -343,27 +336,12 @@ func (d *PolicyRoute) Setup(cfg *types.SetupConfig, netNS ns.NetNS) error {
 	if err != nil {
 		return err
 	}
-
-	if cfg.EnableNetworkPriority {
-		err = utils.SetEgressPriority(eni, cfg.NetworkPriority, cfg.ContainerIPNet)
-		if err != nil {
-			return err
-		}
-	}
-
 	table := utils.GetRouteTableID(eni.Attrs().Index)
 
 	eniCfg := generateENICfgForPolicy(cfg, eni, table)
 	err = nic.Setup(eni, eniCfg)
 	if err != nil {
 		return fmt.Errorf("setup eni config, %w", err)
-	}
-
-	if cfg.StripVlan {
-		err = utils.EnsureVlanTag(eni, cfg.ContainerIPNet, uint16(cfg.Vid))
-		if err != nil {
-			return err
-		}
 	}
 
 	hostVETHCfg := generateHostPeerCfgForPolicy(cfg, hostVETH, table)
@@ -402,65 +380,4 @@ func (d *PolicyRoute) Check(cfg *types.CheckConfig) error {
 		return nil
 	})
 	return err
-}
-
-func (d *PolicyRoute) Teardown(cfg *types.TeardownCfg, netNS ns.NetNS) error {
-	if cfg.ContainerIPNet == nil {
-		return nil
-	}
-
-	extender := utils.NewIPNet(cfg.ContainerIPNet)
-	// delete ip rule by ip
-	exec := func(rule *netlink.Rule) error {
-		rules, err := utils.FindIPRule(rule)
-		if err != nil {
-			return err
-		}
-		for _, r := range rules {
-			err = utils.RuleDel(&r)
-			if err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-	if extender.IPv4 != nil {
-		err := exec(&netlink.Rule{Priority: fromContainerPriority, Src: extender.IPv4})
-		if err != nil {
-			return err
-		}
-		err = exec(&netlink.Rule{Priority: toContainerPriority, Dst: extender.IPv4})
-		if err != nil {
-			return err
-		}
-	}
-	if extender.IPv6 != nil {
-		err := exec(&netlink.Rule{Priority: fromContainerPriority, Src: extender.IPv6})
-		if err != nil {
-			return err
-		}
-		err = exec(&netlink.Rule{Priority: toContainerPriority, Dst: extender.IPv6})
-		if err != nil {
-			return err
-		}
-	}
-
-	link, err := netlink.LinkByIndex(cfg.ENIIndex)
-	if err != nil {
-		if _, ok := err.(netlink.LinkNotFoundError); !ok {
-			return err
-		}
-		return nil
-	}
-
-	err = utils.DelFilter(link, netlink.HANDLE_MIN_EGRESS, cfg.ContainerIPNet)
-	if err != nil {
-		return err
-	}
-
-	if !cfg.EnableNetworkPriority {
-		return nil
-	}
-
-	return utils.DelEgressPriority(link, cfg.ContainerIPNet)
 }

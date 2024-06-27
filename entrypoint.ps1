@@ -168,6 +168,7 @@ function Create-ParentDirectory
   Create-Directory -Path (Split-Path -Path $Path) | Out-Null
 }
 
+
 function Transfer-File
 {
   param (
@@ -175,21 +176,20 @@ function Transfer-File
     [parameter(Mandatory = $true)] [string]$Dst
   )
 
-  if (-not (Test-File -Path $Src)) {
+  $isFolder = Test-Path -Path $Src -PathType Container
+  if (-not $isFolder -and -not (Test-File  $Src)) {
     return
   }
-  if (Test-File -Path $Dst) {
-    $dstHasher = Get-FileHash -Path $Dst
-    $srcHasher = Get-FileHash -Path $Src
-    if ($dstHasher.Hash -eq $srcHasher.Hash) {
-      return
-    }
-  }
+
   try {
     Create-ParentDirectory -Path $Dst | Out-Null
-    Copy-Item -Force -Path $Src -Destination $Dst | Out-Null
+    if ($isFolder) {
+      Copy-Item -Recurse -Force -Path $Src -Destination $Dst | Out-Null
+    } else {
+      Copy-Item -Force -Path $Src -Destination $Dst | Out-Null
+    }
   } catch {
-    throw "Could not transfer file $Src to $Dst : $($_.Exception.Message)"
+    throw "Could not transfer file or directory $Src to $Dst : $($_.Exception.Message)"
   }
 }
 
@@ -265,34 +265,34 @@ function Get-Metadata
 
 # transfer artifacts to host
 Log-Debug "Transferring eni artifacts"
-Transfer-File -Src "c:\opt\bin\terwayd.exe" -Dst "c:\host\opt\bin\terwayd.exe"
-Transfer-File -Src "c:\opt\cni\bin\terway.exe" -Dst "c:\host\opt\cni\bin\terway.exe"
-Transfer-File -Src "c:\opt\cni\bin\host-local.exe" -Dst "c:\host\opt\cni\bin\host-local.exe"
+Transfer-File -Src "$env:CONTAINER_SANDBOX_MOUNT_POINT\opt\bin\terwayd.exe" -Dst "c:\opt\bin\terwayd.exe"
+Transfer-File -Src "$env:CONTAINER_SANDBOX_MOUNT_POINT\opt\cni\bin\terway.exe" -Dst "c:\opt\cni\bin\terway.exe"
+Transfer-File -Src "$env:CONTAINER_SANDBOX_MOUNT_POINT\opt\cni\bin\host-local.exe" -Dst "c:\opt\cni\bin\host-local.exe"
 Log-Info "Transferred eni artifacts"
 
 # transfer eni config to host
 Log-Debug "Transferring eni configuration"
-$eni_config = Get-Content -Path "c:\etc\eni\eni.json" | ConvertFrom-Json | ConvertTo-Hashtable
+$eni_config = Get-Content -Path "$env:CONTAINER_SANDBOX_MOUNT_POINT\etc\eni\eni.json" | ConvertFrom-Json | ConvertTo-Hashtable
 # NB(thxCode): mutate the credential path to the dynamic volume redirecting destination.
 $eni_config["credential_path"] = "/var/addon-terway/token-config"
 $eni_config_conf = $eni_config | ConvertTo-Json -Compress -Depth 32
-$eni_config_conf | Out-File -NoNewline -Encoding ascii -Force -FilePath "c:\host\etc\eni\eni.json"
-Transfer-File -Src "c:\etc\eni\10-terway.conf" -Dst "c:\host\etc\eni\10-terway.conf"
+$eni_config_conf | Out-File -NoNewline -Encoding ascii -Force -FilePath "c:\etc\eni\eni.json"
+Transfer-File -Src "$env:CONTAINER_SANDBOX_MOUNT_POINT\etc\eni\10-terway.conf" -Dst "c:\etc\eni\10-terway.conf"
 Log-Info "Transferred eni configuration"
 
 # generated cni config to host
 Log-Debug "Generating cni configuration"
 $cni_config = @{
-  cniVersion = "0.4.0"
+  cniVersion = "0.3.1"
   name = "terway"
   type = "terway"
 }
-if (Test-File -Path "c:\etc\eni\10-terway.conf") {
-  $cni_config = Get-Content -Path "c:\etc\eni\10-terway.conf" | ConvertFrom-Json | ConvertTo-Hashtable
+if (Test-File -Path "$env:CONTAINER_SANDBOX_MOUNT_POINT\etc\eni\10-terway.conf") {
+  $cni_config = Get-Content -Path "$env:CONTAINER_SANDBOX_MOUNT_POINT\etc\eni\10-terway.conf" | ConvertFrom-Json | ConvertTo-Hashtable
 }
 # version
 if (-not $cni_config["cniVersion"]) {
-  $cni_config["cniVersion"] = "0.4.0"
+  $cni_config["cniVersion"] = "0.3.1"
 }
 # name
 if (-not $cni_config["name"]) {
@@ -310,34 +310,41 @@ if (-not $cni_config["capabilities"]) {
   }
 }
 $cni_config_conf = $cni_config | ConvertTo-Json -Compress -Depth 32
-$cni_config_conf | Out-File -NoNewline -Encoding ascii -Force -FilePath "c:\host\etc\cni\net.d\10-terway.conf"
+$cni_config_conf | Out-File -NoNewline -Encoding ascii -Force -FilePath "c:\etc\cni\net.d\10-terway.conf"
 Log-Info "Generated cni configuration: $cni_config_conf"
 
-# mount
-Log-Debug "Mounting critical resources"
-$env_node_name = $(Get-Env -Key "NODE_NAME")
-$env_pod_namespace = $(Get-Env -Key "POD_NAMESPACE")
-$env_pod_name = $(Get-Env -Key "POD_NAME")
-$env_container_name = $(Get-Env -Key "CONTAINER_NAME")
-$vol_selectors = @(
-  "io.kubernetes.pod.namespace=${env_pod_namespace}"
-  "io.kubernetes.pod.name=${env_pod_name}"
-  "io.kubernetes.container.name=${env_container_name}"
-)
-$vol_paths = @(
-  "c:\var\run\secrets\kubernetes.io\serviceaccount:c:\opt\bin\eni\serviceaccount"
-  "c:\var\addon:c:\var\addon-terway"
-)
-try {
-  wins cli vol mount --selectors="$($vol_selectors -join ' ')" --paths="$($vol_paths -join ' ')"
-} catch {
-  Log-Fatal "Failed to mount volume: $($_.Exception.Message)"
+# # mount
+# Log-Debug "Mounting critical resources"
+# $env_node_name = $(Get-Env -Key "NODE_NAME")
+# $env_pod_namespace = $(Get-Env -Key "POD_NAMESPACE")
+# $env_pod_name = $(Get-Env -Key "POD_NAME")
+# $env_container_name = $(Get-Env -Key "CONTAINER_NAME")
+# $vol_selectors = @(
+#   "io.kubernetes.pod.namespace=${env_pod_namespace}"
+#   "io.kubernetes.pod.name=${env_pod_name}"
+#   "io.kubernetes.container.name=${env_container_name}"
+# )
+# $vol_paths = @(
+#   "c:\var\run\secrets\kubernetes.io\serviceaccount:c:\opt\bin\eni\serviceaccount"
+#   "c:\var\addon:c:\var\addon-terway"
+# )
+# try {
+#   wins cli vol mount --selectors="$($vol_selectors -join ' ')" --paths="$($vol_paths -join ' ')"
+# } catch {
+#   Log-Fatal "Failed to mount volume: $($_.Exception.Message)"
+# }
+# Log-Info "Mounted critical resources"
+
+if (Test-Path -Path "C:\opt\bin\eni\serviceaccount") {
+    Remove-Item -Path "C:\opt\bin\eni\serviceaccount" -Recurse -Force -ErrorAction SilentlyContinue
 }
-Log-Info "Mounted critical resources"
+
+Transfer-File -Src "$env:CONTAINER_SANDBOX_MOUNT_POINT\var\run\secrets\kubernetes.io\serviceaccount" -Dst "c:\opt\bin\eni\serviceaccount"
+Transfer-File -Src "$env:CONTAINER_SANDBOX_MOUNT_POINT\var\addon" -Dst "c:\var\addon-terway"
 
 # generate kubeconfig
 Log-Debug "Generating kubernetes configuration"
-Create-Directory -Path "c:\host\opt\bin\eni"
+Create-Directory -Path "c:\opt\bin\eni"
 $env_cluster_server = Get-Env -Key "CLUSTER_SERVER"
 if (-not $env_cluster_server) {
   Log-Fatal "CLUSTER_SERVER environment variable is blank"
@@ -359,7 +366,7 @@ current-context: default
 users:
 - name: default
   user:
-    tokenFile: c:/opt/bin/eni/serviceaccount/token" | Out-File -NoNewline -Encoding ascii -Force -FilePath "c:\host\opt\bin\eni\kubeconfig.conf"
+    tokenFile: c:/opt/bin/eni/serviceaccount/token" | Out-File -NoNewline -Encoding ascii -Force -FilePath "c:\opt\bin\eni\kubeconfig.conf"
 Log-Info "Generated kubernetes configuration"
 
 # run
@@ -378,10 +385,12 @@ $prc_envs = @(
   "POD_NAMESPACE=${env_pod_namespace}"
 )
 try {
-  wins cli prc run --path="$prc_path" --args="$($prc_args -join ' ')" --envs="$($prc_envs -join ' ')"
+  $Env:NODE_NAME=$(Get-Env -Key "NODE_NAME")
+  $Env:POD_NAMESPACE=$(Get-Env -Key "POD_NAMESPACE")
+  & $prc_path @prc_args
 } catch {
   Log-Fatal "Failed to execute terway: $($_.Exception.Message)"
 } finally {
-  Remove-Item -Path "c:\host\opt\bin\eni\kubeconfig.conf" -Force -ErrorAction Ignore | Out-Null
-  Remove-Item -Path "c:\host\etc\cni\net.d\10-terway.conf" -Force -ErrorAction Ignore | Out-Null
+  Remove-Item -Path "c:\opt\bin\eni\kubeconfig.conf" -Force -ErrorAction Ignore | Out-Null
+  Remove-Item -Path "c:\etc\cni\net.d\10-terway.conf" -Force -ErrorAction Ignore | Out-Null
 }

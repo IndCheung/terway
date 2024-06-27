@@ -1,5 +1,5 @@
 /*
-Copyright 2021-2022 Terway Authors.
+Copyright 2021 Terway Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,6 +23,18 @@ import (
 	"strings"
 	"time"
 
+	aliyunClient "github.com/AliyunContainerService/terway/pkg/aliyun/client"
+	apiErr "github.com/AliyunContainerService/terway/pkg/aliyun/client/errors"
+	"github.com/AliyunContainerService/terway/pkg/apis/network.alibabacloud.com/v1beta1"
+	"github.com/AliyunContainerService/terway/pkg/backoff"
+	register "github.com/AliyunContainerService/terway/pkg/controller"
+	"github.com/AliyunContainerService/terway/pkg/controller/common"
+	"github.com/AliyunContainerService/terway/pkg/controller/vswitch"
+	"github.com/AliyunContainerService/terway/pkg/utils"
+	"github.com/AliyunContainerService/terway/types"
+	"github.com/AliyunContainerService/terway/types/controlplane"
+
+	"github.com/aliyun/alibaba-cloud-sdk-go/services/ecs"
 	"golang.org/x/sync/errgroup"
 	corev1 "k8s.io/api/core/v1"
 	k8sErr "k8s.io/apimachinery/pkg/api/errors"
@@ -41,26 +53,15 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
-
-	aliyunClient "github.com/AliyunContainerService/terway/pkg/aliyun/client"
-	apiErr "github.com/AliyunContainerService/terway/pkg/aliyun/client/errors"
-	"github.com/AliyunContainerService/terway/pkg/apis/network.alibabacloud.com/v1beta1"
-	"github.com/AliyunContainerService/terway/pkg/backoff"
-	register "github.com/AliyunContainerService/terway/pkg/controller"
-	"github.com/AliyunContainerService/terway/pkg/controller/common"
-	"github.com/AliyunContainerService/terway/pkg/utils"
-	"github.com/AliyunContainerService/terway/types"
-	"github.com/AliyunContainerService/terway/types/controlplane"
 )
 
 var ctrlLog = ctrl.Log.WithName(controllerName)
 
 const controllerName = "pod-eni"
-const layout = "2006-01-02T15:04:05Z"
 
 func init() {
-	register.Add(controllerName, func(mgr manager.Manager, ctrlCtx *register.ControllerCtx) error {
-		r := NewReconcilePod(mgr, ctrlCtx.AliyunClient)
+	register.Add(controllerName, func(mgr manager.Manager, aliyunClient register.Interface, swPool *vswitch.SwitchPool) error {
+		r := NewReconcilePod(mgr, aliyunClient)
 		c, err := controller.NewUnmanaged(controllerName, mgr, controller.Options{
 			Reconciler:              r,
 			MaxConcurrentReconciles: controlplane.GetConfig().PodENIMaxConcurrent,
@@ -79,12 +80,14 @@ func init() {
 		}
 
 		return c.Watch(
-			source.Kind(mgr.GetCache(), &v1beta1.PodENI{}),
+			&source.Kind{
+				Type: &v1beta1.PodENI{},
+			},
 			&handler.EnqueueRequestForObject{},
 			&predicate.ResourceVersionChangedPredicate{},
 			&predicateForPodENIEvent{},
 		)
-	}, true)
+	})
 }
 
 var (
@@ -105,7 +108,6 @@ type ReconcilePodENI struct {
 	record record.EventRecorder
 
 	trunkMode bool // use trunk mode or secondary eni mode
-	crdMode   bool
 }
 
 type Wrapper struct {
@@ -115,8 +117,12 @@ type Wrapper struct {
 
 // Start the controller
 func (w *Wrapper) Start(ctx context.Context) error {
+	// on start do clean up
+	w.r.gcSecondaryENI(true)
+	w.r.gcMemberENI(true)
+
 	// start the gc process
-	w.r.gc(ctx)
+	w.r.gc(ctx.Done())
 
 	err := w.ctrl.Start(ctx)
 	if err != nil {
@@ -137,10 +143,9 @@ func NewReconcilePod(mgr manager.Manager, aliyunClient register.Interface) *Reco
 	r := &ReconcilePodENI{
 		client:    mgr.GetClient(),
 		scheme:    mgr.GetScheme(),
-		record:    mgr.GetEventRecorderFor("TerwayPodENIController"),
+		record:    mgr.GetEventRecorderFor("PodENI"),
 		aliyun:    aliyunClient,
 		trunkMode: *controlplane.GetConfig().EnableTrunk,
-		crdMode:   controlplane.GetConfig().IPAMType == types.IPAMTypeCRD,
 	}
 	return r
 }
@@ -151,9 +156,9 @@ func NewReconcilePod(mgr manager.Manager, aliyunClient register.Interface) *Reco
 func (m *ReconcilePodENI) Reconcile(ctx context.Context, request reconcile.Request) (reconcile.Result, error) {
 	l := log.FromContext(ctx)
 	l.Info("Reconcile")
-	start := time.Now()
+
 	podENI := &v1beta1.PodENI{}
-	err := m.client.Get(ctx, request.NamespacedName, podENI)
+	err := m.client.Get(context.Background(), request.NamespacedName, podENI)
 	if err != nil {
 		if k8sErr.IsNotFound(err) {
 			return reconcile.Result{}, nil
@@ -165,46 +170,9 @@ func (m *ReconcilePodENI) Reconcile(ctx context.Context, request reconcile.Reque
 		if !controllerutil.ContainsFinalizer(podENI, types.FinalizerPodENI) {
 			return reconcile.Result{}, nil
 		}
-		result, err := m.podENIDelete(ctx, podENI)
-		m.recordPodENIDeleteErr(podENI, start, err)
-		return result, err
+		return m.podENIDelete(ctx, podENI)
 	}
-	result, err := m.podENICreate(ctx, request.NamespacedName, podENI)
-	if err != nil {
-		m.recordPodENICreateErr(podENI, start, err)
-		return result, err
-	}
-
-	if err = common.SetPodAnnotation(ctx, m.client, podENI); err != nil {
-		m.recordPodENICreateErr(podENI, start, err)
-		return reconcile.Result{}, err
-	}
-
-	return result, nil
-}
-
-func (m *ReconcilePodENI) recordPodENIDeleteErr(podEni *v1beta1.PodENI, startTime time.Time, err error) {
-	if err == nil {
-		return
-	}
-	var pod = &corev1.Pod{}
-	if getErr := m.client.Get(context.Background(), k8stypes.NamespacedName{Namespace: podEni.Namespace, Name: podEni.Name}, pod); getErr != nil {
-		return
-	}
-	m.record.Eventf(pod, corev1.EventTypeWarning,
-		"CniPodENIDeleteErr", fmt.Sprintf("CniPodENIDeleteErr: %s, elapsedTime: %s", err, time.Since(startTime)))
-}
-
-func (m *ReconcilePodENI) recordPodENICreateErr(podEni *v1beta1.PodENI, startTime time.Time, err error) {
-	if err == nil {
-		return
-	}
-	var pod = &corev1.Pod{}
-	if getErr := m.client.Get(context.Background(), k8stypes.NamespacedName{Namespace: podEni.Namespace, Name: podEni.Name}, pod); getErr != nil {
-		return
-	}
-	m.record.Eventf(pod, corev1.EventTypeWarning,
-		"CniCreateENIError", fmt.Sprintf("CniCreateENIError: %s, elapsedTime: %s", err, time.Since(startTime)))
+	return m.podENICreate(ctx, request.NamespacedName, podENI)
 }
 
 // NeedLeaderElection need election
@@ -215,14 +183,16 @@ func (m *ReconcilePodENI) NeedLeaderElection() bool {
 // gc will handle following circumstances
 // 1. cr podENI is leaked
 // 2. release fixed ip resource by strategy
-func (m *ReconcilePodENI) gc(ctx context.Context) {
-	go wait.JitterUntilWithContext(ctx, func(ctx context.Context) {
-		m.gcSecondaryENI(ctx)
+func (m *ReconcilePodENI) gc(stopCh <-chan struct{}) {
+	go wait.Until(func() {
+		m.gcSecondaryENI(false)
+	}, leakedENICheckPeriod, stopCh)
 
-		m.gcMemberENI(ctx)
-	}, leakedENICheckPeriod, 1.1, true)
+	go wait.Until(func() {
+		m.gcMemberENI(false)
+	}, leakedENICheckPeriod, stopCh)
 
-	go wait.JitterUntilWithContext(ctx, m.gcCRPodENIs, podENICheckPeriod, 1.1, true)
+	go wait.Until(m.gcCRPodENIs, podENICheckPeriod, stopCh)
 }
 
 func (m *ReconcilePodENI) podENICreate(ctx context.Context, namespacedName client.ObjectKey, podENI *v1beta1.PodENI) (result reconcile.Result, err error) {
@@ -240,7 +210,6 @@ func (m *ReconcilePodENI) podENICreate(ctx context.Context, namespacedName clien
 		// for pod require to unbind eni
 		defer func() {
 			if err != nil {
-				l.Error(err, "detach failed")
 				m.record.Eventf(podENI, corev1.EventTypeWarning, types.EventDetachENIFailed, "%s", err.Error())
 			}
 		}()
@@ -283,7 +252,7 @@ func (m *ReconcilePodENI) podENICreate(ctx context.Context, namespacedName clien
 		}
 
 		if m.trunkMode && nodeInfo.TrunkENIID == "" {
-			return reconcile.Result{}, fmt.Errorf("trunk eni id not found, this may due to terway agent is not started")
+			return reconcile.Result{}, fmt.Errorf("trunk eni id not found, this may dure to terway agent is not started")
 		} else if !m.trunkMode && nodeInfo.TrunkENIID != "" {
 			nodeInfo.TrunkENIID = ""
 		}
@@ -292,7 +261,7 @@ func (m *ReconcilePodENI) podENICreate(ctx context.Context, namespacedName clien
 		if podENI.Status.Phase == "" {
 			needAttach = true
 		} else {
-			if utils.IsFixedNamePod(pod) {
+			if utils.IsStsPod(pod) {
 				for _, alloc := range podENI.Spec.Allocations {
 					if alloc.AllocationType.Type == v1beta1.IPAllocTypeFixed {
 						needAttach = true
@@ -352,7 +321,7 @@ func (m *ReconcilePodENI) podENIDelete(ctx context.Context, podENI *v1beta1.PodE
 		return reconcile.Result{}, fmt.Errorf("error detachMemberENI podENI status to %s", v1beta1.ENIPhaseUnbind)
 	}
 	// delete eni
-	err = m.deleteMemberENI(ctx, podENICopy)
+	err = m.deleteMemberENI(podENICopy)
 	if err != nil {
 		return reconcile.Result{}, fmt.Errorf("error delete eni, %w", err)
 	}
@@ -364,9 +333,9 @@ func (m *ReconcilePodENI) podENIDelete(ctx context.Context, podENI *v1beta1.PodE
 	return reconcile.Result{}, err
 }
 
-func (m *ReconcilePodENI) gcSecondaryENI(ctx context.Context) {
+func (m *ReconcilePodENI) gcSecondaryENI(force bool) {
 	// 1. list all available enis ( which type is secondary)
-	enis, err := m.aliyun.DescribeNetworkInterface(ctx, controlplane.GetConfig().VPCID, nil, "", aliyunClient.ENITypeSecondary, aliyunClient.ENIStatusAvailable, nil)
+	enis, err := m.aliyun.DescribeNetworkInterface(context.Background(), controlplane.GetConfig().VPCID, nil, "", aliyunClient.ENITypeSecondary, aliyunClient.ENIStatusAvailable)
 	if err != nil {
 		ctrlLog.Error(err, "error list all member enis")
 		return
@@ -375,25 +344,16 @@ func (m *ReconcilePodENI) gcSecondaryENI(ctx context.Context) {
 		return
 	}
 
-	var networkInterfaces []*aliyunClient.NetworkInterface
-	for _, networkInterface := range enis {
-		if networkInterface.Type != aliyunClient.ENITypeSecondary {
-			continue
-		}
-
-		networkInterfaces = append(networkInterfaces, networkInterface)
-	}
-
-	err = m.gcENIs(ctx, networkInterfaces)
+	err = m.gcENIs(enis, force)
 	if err != nil {
 		ctrlLog.Error(err, "error gc enis")
 		return
 	}
 }
 
-func (m *ReconcilePodENI) gcMemberENI(ctx context.Context) {
+func (m *ReconcilePodENI) gcMemberENI(force bool) {
 	// 1. list all attached member eni
-	enis, err := m.aliyun.DescribeNetworkInterface(ctx, controlplane.GetConfig().VPCID, nil, "", aliyunClient.ENITypeMember, aliyunClient.ENIStatusInUse, nil)
+	enis, err := m.aliyun.DescribeNetworkInterface(context.Background(), controlplane.GetConfig().VPCID, nil, "", aliyunClient.ENITypeMember, aliyunClient.ENIStatusInUse)
 	if err != nil {
 		ctrlLog.Error(err, "error list all member enis")
 		return
@@ -401,48 +361,42 @@ func (m *ReconcilePodENI) gcMemberENI(ctx context.Context) {
 	if len(enis) == 0 {
 		return
 	}
-	var networkInterfaces []*aliyunClient.NetworkInterface
-	for _, networkInterface := range enis {
-		if networkInterface.Type != aliyunClient.ENITypeMember {
-			continue
-		}
 
-		networkInterfaces = append(networkInterfaces, networkInterface)
-	}
-
-	err = m.gcENIs(ctx, networkInterfaces)
+	err = m.gcENIs(enis, force)
 	if err != nil {
 		ctrlLog.Error(err, "error gc enis")
 		return
 	}
 }
 
-func (m *ReconcilePodENI) gcENIs(ctx context.Context, enis []*aliyunClient.NetworkInterface) error {
+func (m *ReconcilePodENI) gcENIs(enis []ecs.NetworkInterfaceSet, force bool) error {
 	l := ctrl.Log.WithName("gc-enis")
 
-	eniMap := make(map[string]*aliyunClient.NetworkInterface, len(enis))
+	eniMap := make(map[string]*ecs.NetworkInterfaceSet, len(enis))
 
 	// 1. filter out eni which is created by terway
 	tagFilter := map[string]string{
 		types.TagKeyClusterID:               controlplane.GetConfig().ClusterID,
 		types.NetworkInterfaceTagCreatorKey: types.TagTerwayController,
 	}
+	layout := "2006-01-02T15:04:05Z"
 	now := time.Now()
 	for i, eni := range enis {
 		if !m.eniFilter(eni, tagFilter) {
 			continue
 		}
-		t, err := time.Parse(layout, eni.CreationTime)
-		if err != nil {
-			l.Error(err, "error parse eni create time")
-			continue
+		if !force {
+			t, err := time.Parse(layout, eni.CreationTime)
+			if err != nil {
+				l.Error(err, "error parse eni create time")
+				continue
+			}
+			// avoid conflict with create process
+			if t.Add(10 * time.Minute).After(now) {
+				continue
+			}
 		}
-		// avoid conflict with create process
-		if t.Add(10 * time.Minute).After(now) {
-			continue
-		}
-
-		eniMap[eni.NetworkInterfaceID] = enis[i]
+		eniMap[eni.NetworkInterfaceId] = &enis[i]
 	}
 	if len(eniMap) == 0 {
 		return nil
@@ -450,7 +404,7 @@ func (m *ReconcilePodENI) gcENIs(ctx context.Context, enis []*aliyunClient.Netwo
 
 	// 2. list cr get all using eni
 	podENIs := &v1beta1.PodENIList{}
-	err := m.client.List(ctx, podENIs)
+	err := m.client.List(context.Background(), podENIs)
 	if err != nil {
 		l.Error(err, "error list cr pod enis")
 		return err
@@ -465,24 +419,25 @@ func (m *ReconcilePodENI) gcENIs(ctx context.Context, enis []*aliyunClient.Netwo
 			}
 			delete(eniMap, alloc.ENI.ID)
 		}
+
 	}
 
 	// 4. the left eni is going to be deleted
 	for _, eni := range eniMap {
-		if eni.Type == aliyunClient.ENITypeMember && eni.Status == aliyunClient.ENIStatusInUse {
-			l.Info("detach eni", "eni", eni.NetworkInterfaceID, "trunk-eni", eni.TrunkNetworkInterfaceID)
-			err = m.aliyun.DetachNetworkInterface(ctx, eni.NetworkInterfaceID, eni.InstanceID, eni.TrunkNetworkInterfaceID) // still need delegate ? otherwise may break quota
+		if eni.Type == string(aliyunClient.ENITypeMember) && eni.Status == string(aliyunClient.ENIStatusInUse) {
+			l.Info("detach eni", "eni", eni.NetworkInterfaceId, "trunk-eni", eni.Attachment.TrunkNetworkInterfaceId)
+			err = m.aliyun.DetachNetworkInterface(context.Background(), eni.NetworkInterfaceId, eni.Attachment.InstanceId, eni.Attachment.TrunkNetworkInterfaceId)
 			if err != nil {
-				l.Error(err, fmt.Sprintf("errot detach eni %s", eni.NetworkInterfaceID))
+				l.Error(err, fmt.Sprintf("errot detach eni %s", eni.NetworkInterfaceId))
 			}
 			// we continue here because we can delete eni in next check
 			continue
 		}
-		if eni.Status == aliyunClient.ENIStatusAvailable {
-			l.Info("delete eni", "eni", eni.NetworkInterfaceID)
-			err = m.aliyun.DeleteNetworkInterface(ctx, eni.NetworkInterfaceID)
+		if eni.Status == string(aliyunClient.ENIStatusAvailable) {
+			l.Info("delete eni", "eni", eni.NetworkInterfaceId)
+			err = m.aliyun.DeleteNetworkInterface(context.Background(), eni.NetworkInterfaceId)
 			if err != nil {
-				l.Info(fmt.Sprintf("delete leaked eni %s, %s", eni.NetworkInterfaceID, err))
+				l.Info(fmt.Sprintf("delete leaked eni %s, %s", eni.NetworkInterfaceId, err))
 			}
 			continue
 		}
@@ -491,11 +446,11 @@ func (m *ReconcilePodENI) gcENIs(ctx context.Context, enis []*aliyunClient.Netwo
 }
 
 // gcCRPodENIs remove useless cr res
-func (m *ReconcilePodENI) gcCRPodENIs(ctx context.Context) {
+func (m *ReconcilePodENI) gcCRPodENIs() {
 	l := ctrl.Log.WithName("gc-podENI")
 
 	podENIs := &v1beta1.PodENIList{}
-	err := m.client.List(ctx, podENIs)
+	err := m.client.List(context.Background(), podENIs)
 	if err != nil {
 		l.Error(err, "error list cr pod enis")
 		return
@@ -506,7 +461,7 @@ func (m *ReconcilePodENI) gcCRPodENIs(ctx context.Context) {
 	// 3. clean fixed ip cr
 	for _, podENI := range podENIs.Items {
 		func() {
-			ctx, cancel := context.WithTimeout(ctx, 1*time.Minute)
+			ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
 			defer cancel()
 
 			p := &corev1.Pod{}
@@ -525,23 +480,26 @@ func (m *ReconcilePodENI) gcCRPodENIs(ctx context.Context) {
 
 			// pod exist just update timestamp
 			if err == nil {
-				if podRequirePodENI(p, m.crdMode) {
-					// for non fixed-ip pod no need to update timeStamp
-					if !podENI.Spec.HaveFixedIP() {
-						return
-					}
-
-					ll.V(5).Info("update pod lastSeen to now")
-					update := podENI.DeepCopy()
-					update.Status.PodLastSeen = metav1.Now()
-
-					err = m.client.Status().Patch(ctx, update, client.MergeFrom(&podENI))
+				if !podRequirePodENI(p) {
+					err = m.deletePodENI(ctx, &podENI)
 					if err != nil {
-						ll.Error(err, "error update timestamp")
+						ll.Error(err, "error set podENI to ENIPhaseDeleting")
 					}
 					return
 				}
-				// pod not require pod eni, so follow the release strategy
+				// for non fixed-ip pod no need to update timeStamp
+				if !podENI.Spec.HaveFixedIP() {
+					return
+				}
+
+				ll.V(5).Info("update pod lastSeen to now")
+				update := podENI.DeepCopy()
+				update.Status.PodLastSeen = metav1.Now()
+				_, err = common.PatchPodENIStatus(ctx, m.client, update, &podENI)
+				if err != nil {
+					ll.Error(err, "error update timestamp")
+				}
+				return
 			}
 
 			switch podENI.Status.Phase {
@@ -660,16 +618,22 @@ func (m *ReconcilePodENI) attachENI(ctx context.Context, podENI *v1beta1.PodENI)
 			if err != nil {
 				return err
 			}
+			time.Sleep(backoff.Backoff(backoff.WaitENIStatus).Duration)
 
-			eni, err := m.aliyun.WaitForNetworkInterface(ctx, alloc.ENI.ID, aliyunClient.ENIStatusInUse, backoff.Backoff(backoff.WaitENIStatus), false)
+			realClient, _, err := common.Became(ctx, m.aliyun)
+			if err != nil {
+				return err
+			}
+
+			eni, err := realClient.WaitForNetworkInterface(ctx, alloc.ENI.ID, aliyunClient.ENIStatusInUse, backoff.Backoff(backoff.WaitENIStatus), false)
 			if err != nil {
 				return err
 			}
 
 			ch <- &v1beta1.ENIInfo{
-				ID:     eni.NetworkInterfaceID,
+				ID:     eni.NetworkInterfaceId,
 				Type:   v1beta1.ENIType(eni.Type),
-				Vid:    eni.DeviceIndex,
+				Vid:    eni.Attachment.DeviceIndex,
 				Status: v1beta1.ENIStatusBind,
 			}
 			return nil
@@ -698,27 +662,32 @@ func (m *ReconcilePodENI) detachMemberENI(ctx context.Context, podENI *v1beta1.P
 		ctx := common.WithCtx(ctx, &alloc)
 		instanceID := podENI.Status.InstanceID
 		trunkENIID := podENI.Status.TrunkENIID
+		realClient, _, err := common.Became(ctx, m.aliyun)
+		if err != nil {
+			return err
+		}
 		if podENI.Status.InstanceID == "" {
-			enis, err := m.aliyun.DescribeNetworkInterface(ctx, "", []string{alloc.ENI.ID}, "", "", "", nil)
+			enis, err := realClient.DescribeNetworkInterface(ctx, "", []string{alloc.ENI.ID}, "", "", "")
 			if err != nil {
 				return err
 			}
 			if len(enis) == 0 {
 				continue
 			}
-			if enis[0].InstanceID == "" {
+			if enis[0].Attachment.InstanceId == "" {
 				continue
 			}
-			instanceID = enis[0].InstanceID
-			trunkENIID = enis[0].TrunkNetworkInterfaceID
+			instanceID = enis[0].Attachment.InstanceId
+			trunkENIID = enis[0].Attachment.TrunkNetworkInterfaceId
 		}
 
 		err = m.aliyun.DetachNetworkInterface(ctx, alloc.ENI.ID, instanceID, trunkENIID)
 		if err != nil {
 			return err
 		}
+		time.Sleep(backoff.Backoff(backoff.WaitENIStatus).Duration)
 
-		_, err = m.aliyun.WaitForNetworkInterface(ctx, alloc.ENI.ID, aliyunClient.ENIStatusAvailable, backoff.Backoff(backoff.WaitENIStatus), true)
+		_, err = realClient.WaitForNetworkInterface(ctx, alloc.ENI.ID, aliyunClient.ENIStatusAvailable, backoff.Backoff(backoff.WaitENIStatus), true)
 		if err == nil {
 			continue
 		}
@@ -731,7 +700,7 @@ func (m *ReconcilePodENI) detachMemberENI(ctx context.Context, podENI *v1beta1.P
 	return nil
 }
 
-func (m *ReconcilePodENI) deleteMemberENI(ctx context.Context, podENI *v1beta1.PodENI) (err error) {
+func (m *ReconcilePodENI) deleteMemberENI(podENI *v1beta1.PodENI) (err error) {
 	defer func() {
 		if err != nil {
 			m.record.Eventf(podENI, corev1.EventTypeWarning, types.EventDeleteENIFailed, err.Error())
@@ -744,7 +713,12 @@ func (m *ReconcilePodENI) deleteMemberENI(ctx context.Context, podENI *v1beta1.P
 		if alloc.ENI.ID == "" {
 			continue
 		}
-		err = m.aliyun.DeleteNetworkInterface(common.WithCtx(ctx, &alloc), alloc.ENI.ID)
+		ctx := common.WithCtx(context.Background(), &alloc)
+		realClient, _, err := common.Became(ctx, m.aliyun)
+		if err != nil {
+			return err
+		}
+		err = realClient.DeleteNetworkInterface(context.Background(), alloc.ENI.ID)
 		if err != nil {
 			return err
 		}
@@ -754,10 +728,10 @@ func (m *ReconcilePodENI) deleteMemberENI(ctx context.Context, podENI *v1beta1.P
 }
 
 // eniFilter will compare eni tags with filter, if all filter match return true
-func (m *ReconcilePodENI) eniFilter(eni *aliyunClient.NetworkInterface, filter map[string]string) bool {
+func (m *ReconcilePodENI) eniFilter(eni ecs.NetworkInterfaceSet, filter map[string]string) bool {
 	for k, v := range filter {
 		found := false
-		for _, tag := range eni.Tags {
+		for _, tag := range eni.Tags.Tag {
 			if tag.TagKey != k {
 				continue
 			}
@@ -782,6 +756,14 @@ func (m *ReconcilePodENI) getNode(ctx context.Context, name string) (*corev1.Nod
 	return node, err
 }
 
+func (m *ReconcilePodENI) deletePodENI(ctx context.Context, podENI *v1beta1.PodENI) error {
+	update := podENI.DeepCopy()
+	update.Status.Phase = v1beta1.ENIPhaseDeleting
+
+	_, err := common.UpdatePodENIStatus(ctx, m.client, update)
+	return err
+}
+
 func allocIDs(podENI *v1beta1.PodENI) []string {
 	var ids []string
 	for _, alloc := range podENI.Spec.Allocations {
@@ -790,18 +772,12 @@ func allocIDs(podENI *v1beta1.PodENI) []string {
 	return ids
 }
 
-func podRequirePodENI(pod *corev1.Pod, ignore bool) bool {
-	if utils.PodSandboxExited(pod) {
-		return false
-	}
-
-	if ignore {
-		return true
-	}
-
+func podRequirePodENI(pod *corev1.Pod) bool {
 	if !types.PodUseENI(pod) {
 		return false
 	}
-
+	if utils.IsJobPod(pod) && utils.PodSandboxExited(pod) {
+		return false
+	}
 	return true
 }
